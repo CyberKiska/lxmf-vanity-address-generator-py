@@ -10,6 +10,7 @@ A simple CLI tool to generate [LXMF](https://github.com/markqvist/LXMF) vanity a
 `python main.py [--postfix=<POSTFIX>] [--prefix=<PREFIX>] [--workers=<NUMBER_OF_THREADS>] [--out=<DESTINATION>]`
 
 ## Notes:
+* If you want to use a more optimized version, you can use the [Go language LXMF vanity address generator](https://github.com/CyberKiska/lxmf-vanity-address-generator) implementation. The performance difference with the Python implementation is approximately 30-35 times. Note: The Python version uses the official reference library, while the Go version uses raw cryptographic primitives.
 * It is necessary to have an installed [Reticulum](https://github.com/markqvist/Reticulum).
 * Either `--prefix` or `--postfix` must be set; both accept from 1 to 32 hex chars.
 * Prefix is matched on lowercase hex of the 16-byte destination hash. So use [Hexspeak](https://en.wikipedia.org/wiki/Hexspeak) to select the prefix/postfix.
