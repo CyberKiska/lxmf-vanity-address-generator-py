@@ -1,1 +1,4 @@
-rns>=1.0.1,<2.0
+cryptography>=50.0.0
+packaging>=24.0
+pyserial>=3.5
+rns>=1.4.2,<2.0
