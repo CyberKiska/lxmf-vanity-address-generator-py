@@ -5,4 +5,9 @@ node_modules/
 .idea/
 path/
 identity
+*.identity
+*.rid
+.lxmf-identity-*.staging
+.lxmf-identity-*.probe
 __pycache__/
+.ruff_cache/
