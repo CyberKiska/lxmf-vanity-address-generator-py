@@ -1,0 +1,4 @@
+-r requirements.txt
+bandit==1.9.4
+pip-audit==2.10.1
+ruff==0.15.22
