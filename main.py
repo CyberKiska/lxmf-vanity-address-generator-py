@@ -11,9 +11,10 @@ from importlib.metadata import (
     distribution,
     version as distribution_version,
 )
+import json
 import multiprocessing as mp
+from multiprocessing.connection import Connection, wait
 import os
-import queue
 import signal
 import sys
 import tempfile
@@ -39,11 +40,12 @@ MIN_CRYPTOGRAPHY_VERSION = Version("50.0.0")
 DEST_HASH_HEX_LEN = RNS.Reticulum.TRUNCATED_HASHLENGTH // 4
 HEX_ALPHABET = frozenset("0123456789abcdef")
 PROGRESS_BATCH_SIZE = 1024
+CANCEL_CHECK_INTERVAL = 64
+# A frame plus Connection's four-byte header fits POSIX's minimum PIPE_BUF.
+# A killed writer therefore cannot leave a partial message blocking the reader.
+MAX_WORKER_MESSAGE_BYTES = 508
 STATUS_INTERVAL = 1.0
 SHUTDOWN_TIMEOUT = 5.0
-QUEUE_FLUSH_GRACE = 0.25
-WORKER_EXIT_GRACE = 1.0
-WORKER_HEALTH_INTERVAL = 0.25
 MAX_UNFORCED_CONSTRAINED_HEX = 6
 DEFAULT_MAX_WORKERS = 32
 ABSOLUTE_MAX_WORKERS = 256
@@ -57,6 +59,7 @@ PUBLISH_HARD_LINK = "hard-link"
 PUBLISH_EXCLUSIVE_COPY = "exclusive-copy"
 
 MSG_PROGRESS = "progress"
+MSG_READY = "ready"
 MSG_MATCH = "match"
 MSG_ERROR = "error"
 MSG_DONE = "done"
@@ -94,8 +97,16 @@ class SearchState:
     match_private_key: bytes | None = None
     match_addr_hex: str | None = None
     errors: list[str] = field(default_factory=list)
+    ready_workers: set[int] = field(default_factory=set)
     done_workers: set[int] = field(default_factory=set)
     attempt_count_exact: bool = True
+
+
+@dataclass
+class WorkerHandle:
+    process: mp.Process
+    messages: Connection
+    cancel: Connection
 
 
 def lxmf_hash_hex_for_identity(identity: RNS.Identity) -> str:
@@ -811,12 +822,24 @@ def matches_vanity(addr_hex: str, prefix_hex: str, postfix_hex: str) -> bool:
     )
 
 
+def send_worker_message(connection: Connection, message: tuple) -> None:
+    """Send bounded JSON; private keys are encoded only for the local pipe."""
+    if message[0] == MSG_MATCH:
+        message = (*message[:2], message[2].hex(), message[3])
+    payload = json.dumps(message, ensure_ascii=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    if len(payload) > MAX_WORKER_MESSAGE_BYTES:
+        raise ValueError("worker message exceeds the atomic frame limit")
+    connection.send_bytes(payload)
+
+
 def worker(
     worker_id: int,
     prefix_hex: str,
     postfix_hex: str,
-    stop_evt: mp.Event,
-    out_q: mp.Queue,
+    cancel: Connection,
+    messages: Connection,
 ) -> None:
     for signal_name in ("SIGINT", "SIGTERM"):
         child_signal = getattr(signal, signal_name, None)
@@ -828,32 +851,76 @@ def worker(
 
     local_tries = 0
     reported_tries = 0
-
     try:
-        while not stop_evt.is_set():
-            identity = gen_identity()
-            addr_hex = lxmf_hash_hex_for_identity(identity)
-            local_tries += 1
-
-            # addr_hex comes directly from bytes.hex(), so it is already a
-            # canonical lowercase hash. Avoid rescanning all 32 characters in
-            # the hot loop; the parent performs full canonical validation.
-            if _matches_patterns(addr_hex, prefix_hex, postfix_hex):
-                out_q.put((MSG_MATCH, worker_id, identity.get_private_key(), addr_hex))
-                stop_evt.set()
-                break
-
-            if local_tries - reported_tries >= PROGRESS_BATCH_SIZE:
-                out_q.put((MSG_PROGRESS, worker_id, local_tries - reported_tries))
-                reported_tries = local_tries
+        send_worker_message(messages, (MSG_READY, worker_id))
+        # The parent is the only holder of the cancellation writer. EOF means
+        # cancellation, including when the parent crashes. No shared lock or
+        # queue feeder thread can be stranded by an abruptly killed worker.
+        while not cancel.poll():
+            for _ in range(CANCEL_CHECK_INTERVAL):
+                identity = gen_identity()
+                addr_hex = lxmf_hash_hex_for_identity(identity)
+                local_tries += 1
+                if _matches_patterns(addr_hex, prefix_hex, postfix_hex):
+                    send_worker_message(
+                        messages,
+                        (MSG_MATCH, worker_id, identity.get_private_key(), addr_hex),
+                    )
+                    return
+                if local_tries - reported_tries >= PROGRESS_BATCH_SIZE:
+                    send_worker_message(
+                        messages,
+                        (MSG_PROGRESS, worker_id, local_tries - reported_tries),
+                    )
+                    reported_tries = local_tries
+    except (BrokenPipeError, EOFError):
+        pass  # The parent has exited or closed this worker's result channel.
     except Exception as exc:
-        out_q.put((MSG_ERROR, worker_id, f"{type(exc).__name__}: {exc}"))
-        stop_evt.set()
+        error = ascii(f"{type(exc).__name__}: {exc}")[1:-1][:160]
+        try:
+            send_worker_message(messages, (MSG_ERROR, worker_id, error))
+        except OSError:
+            pass
     finally:
-        leftover = local_tries - reported_tries
-        if leftover:
-            out_q.put((MSG_PROGRESS, worker_id, leftover))
-        out_q.put((MSG_DONE, worker_id))
+        try:
+            leftover = local_tries - reported_tries
+            if leftover:
+                send_worker_message(messages, (MSG_PROGRESS, worker_id, leftover))
+            send_worker_message(messages, (MSG_DONE, worker_id))
+        except OSError:
+            pass
+        finally:
+            cancel.close()
+            messages.close()
+
+
+def start_worker(worker_id: int, prefix_hex: str, postfix_hex: str) -> WorkerHandle:
+    context = mp.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    try:
+        with sender:
+            cancel_reader, cancel_writer = context.Pipe(duplex=False)
+            try:
+                with cancel_reader:
+                    process = context.Process(
+                        target=worker,
+                        args=(
+                            worker_id,
+                            prefix_hex,
+                            postfix_hex,
+                            cancel_reader,
+                            sender,
+                        ),
+                        name=f"vanity-worker-{worker_id}",
+                    )
+                    process.start()
+            except BaseException:
+                cancel_writer.close()
+                raise
+    except BaseException:
+        receiver.close()
+        raise
+    return WorkerHandle(process, receiver, cancel_writer)
 
 
 def validate_match_payload(
@@ -864,6 +931,8 @@ def validate_match_payload(
 ) -> tuple[bytes, str] | str:
     if not isinstance(private_key, bytes):
         return "worker returned a non-bytes private key"
+    if len(private_key) != 64:
+        return "worker returned a private key with an invalid length"
     if not isinstance(claimed_addr_hex, str):
         return "worker returned a non-string destination hash"
 
@@ -903,7 +972,18 @@ def record_worker_message(
         )
 
     try:
-        if tag == MSG_PROGRESS and len(message) == 3:
+        if (
+            len(message) > 1
+            and type(message[1]) is int
+            and message[1] in state.done_workers
+        ):
+            raise ValueError("message received after worker completion")
+        if tag == MSG_READY and len(message) == 2:
+            worker_id = message[1]
+            if not valid_worker_id(worker_id) or worker_id in state.ready_workers:
+                raise ValueError("invalid or duplicate worker readiness")
+            state.ready_workers.add(worker_id)
+        elif tag == MSG_PROGRESS and len(message) == 3:
             worker_id, count = message[1], message[2]
             if not valid_worker_id(worker_id) or type(count) is not int or count < 0:
                 raise ValueError("invalid progress payload")
@@ -963,9 +1043,52 @@ def print_status(total_tries: int, started_at: float, nominal_attempts: int) -> 
     )
 
 
+def receive_worker_messages(
+    workers: Sequence[WorkerHandle],
+    state: SearchState,
+    prefix_hex: str,
+    postfix_hex: str,
+    timeout: float,
+) -> None:
+    readers = {
+        handle.messages: worker_id
+        for worker_id, handle in enumerate(workers)
+        if not handle.messages.closed
+    }
+    if not readers:
+        return
+    for connection in wait(list(readers), timeout=timeout):
+        worker_id = readers[connection]
+        try:
+            message = json.loads(connection.recv_bytes(MAX_WORKER_MESSAGE_BYTES))
+            if (
+                not isinstance(message, list)
+                or len(message) < 2
+                or message[1] != worker_id
+            ):
+                raise ValueError("invalid worker message envelope")
+            if message[0] == MSG_MATCH and len(message) == 4:
+                if not isinstance(message[2], str) or len(message[2]) != 128:
+                    raise ValueError("invalid encoded private key")
+                message[2] = bytes.fromhex(message[2])
+            record_worker_message(
+                tuple(message), state, prefix_hex, postfix_hex, len(workers)
+            )
+        except EOFError:
+            connection.close()
+            if worker_id not in state.done_workers:
+                state.errors.append(
+                    f"worker {worker_id} closed its result pipe without completion"
+                )
+        except (OSError, ValueError, TypeError):
+            connection.close()
+            state.errors.append(
+                f"worker {worker_id} sent an unreadable or invalid message"
+            )
+
+
 def wait_for_search_trigger(
-    procs: Sequence[mp.Process],
-    out_q: mp.Queue,
+    workers: Sequence[WorkerHandle],
     state: SearchState,
     prefix_hex: str,
     postfix_hex: str,
@@ -974,51 +1097,16 @@ def wait_for_search_trigger(
     signal_state: SignalState | None = None,
 ) -> None:
     last_status = started_at
-    last_health_check = 0.0
-    dead_without_done_since: dict[int, float] = {}
-
+    reported_ready = False
     while state.match_private_key is None and not state.errors:
         if signal_state is not None:
             signal_state.raise_if_requested()
-        try:
-            message = out_q.get(timeout=0.25)
-        except queue.Empty:
-            queue_was_empty = True
-        else:
-            queue_was_empty = False
-            record_worker_message(
-                message,
-                state,
-                prefix_hex,
-                postfix_hex,
-                worker_count=len(procs),
-            )
-            if message and isinstance(message, tuple) and message[0] == MSG_DONE:
-                worker_id = message[1] if len(message) > 1 else None
-                if isinstance(worker_id, int):
-                    dead_without_done_since.pop(worker_id, None)
-
-        health_now = time.monotonic()
-        if queue_was_empty or health_now - last_health_check >= WORKER_HEALTH_INTERVAL:
-            all_workers_exited = True
-            for worker_id, proc in enumerate(procs):
-                if proc.is_alive():
-                    all_workers_exited = False
-                    dead_without_done_since.pop(worker_id, None)
-                elif worker_id not in state.done_workers:
-                    first_seen = dead_without_done_since.setdefault(
-                        worker_id, health_now
-                    )
-                    if health_now - first_seen >= WORKER_EXIT_GRACE:
-                        state.errors.append(
-                            f"worker {worker_id} exited unexpectedly with "
-                            f"exit code {proc.exitcode} and no completion message"
-                        )
-                        return
-            if all_workers_exited and state.done_workers == set(range(len(procs))):
-                return
-            last_health_check = health_now
-
+        if len(state.done_workers) == len(workers):
+            return
+        receive_worker_messages(workers, state, prefix_hex, postfix_hex, 0.25)
+        if not reported_ready and len(state.ready_workers) == len(workers):
+            print(f"[ready] workers={len(workers)}", file=sys.stderr, flush=True)
+            reported_ready = True
         now = time.perf_counter()
         if now - last_status >= STATUS_INTERVAL:
             print_status(state.total_tries, started_at, nominal_attempts)
@@ -1026,94 +1114,55 @@ def wait_for_search_trigger(
 
 
 def collect_worker_shutdown(
-    procs: Sequence[mp.Process],
-    stop_evt: mp.Event,
-    out_q: mp.Queue,
+    workers: Sequence[WorkerHandle],
     state: SearchState,
     prefix_hex: str,
     postfix_hex: str,
     *,
     report_missing: bool = True,
 ) -> None:
-    stop_evt.set()
     deadline = time.monotonic() + SHUTDOWN_TIMEOUT
-    last_message_at = time.monotonic()
-    expected_worker_ids = set(range(len(procs)))
-
+    for handle in workers:
+        handle.cancel.close()
+    expected_worker_ids = set(range(len(workers)))
     while (
         not expected_worker_ids.issubset(state.done_workers)
+        and any(not handle.messages.closed for handle in workers)
         and time.monotonic() < deadline
     ):
-        try:
-            message = out_q.get(timeout=0.1)
-        except queue.Empty:
-            if (
-                not any(proc.is_alive() for proc in procs)
-                and time.monotonic() - last_message_at >= QUEUE_FLUSH_GRACE
-            ):
-                break
-        else:
-            last_message_at = time.monotonic()
-            record_worker_message(
-                message,
-                state,
-                prefix_hex,
-                postfix_hex,
-                worker_count=len(procs),
-            )
+        receive_worker_messages(
+            workers,
+            state,
+            prefix_hex,
+            postfix_hex,
+            min(0.1, max(0.0, deadline - time.monotonic())),
+        )
+    for handle in workers:
+        handle.process.join(timeout=max(0.0, deadline - time.monotonic()))
+    for handle in workers:
+        if handle.process.is_alive():
+            handle.process.kill()
+    kill_deadline = time.monotonic() + 1.0
+    for handle in workers:
+        handle.process.join(timeout=max(0.0, kill_deadline - time.monotonic()))
 
-    graceful_join_deadline = time.monotonic() + 0.5
-    for proc in procs:
-        remaining = graceful_join_deadline - time.monotonic()
-        if remaining > 0:
-            proc.join(timeout=remaining)
-
-    # Children intentionally ignore SIGTERM so process-group termination can
-    # be coordinated by the parent. After the cooperative deadline, skip the
-    # ineffective POSIX terminate() step and use the strongest available stop.
-    for proc in procs:
-        if proc.is_alive():
-            if hasattr(proc, "kill"):
-                proc.kill()
-            else:  # pragma: no cover - legacy Python/platform fallback
-                proc.terminate()
-    for proc in procs:
-        proc.join(timeout=0.5)
-
-    survivors = [proc.name for proc in procs if proc.is_alive()]
+    survivors = [handle.process.name for handle in workers if handle.process.is_alive()]
     if survivors:
         state.attempt_count_exact = False
         raise RuntimeError(
             "worker processes did not stop after forced shutdown: "
             + ", ".join(survivors)
         )
-
-    # A worker's DONE marker is ordered after all of its other queue messages.
-    # If every marker arrived, all attempt deltas arrived as well.
+    for worker_id, handle in enumerate(workers):
+        if handle.process.exitcode != 0 and report_missing:
+            state.errors.append(
+                f"worker {worker_id} exited with code {handle.process.exitcode}"
+            )
     if state.done_workers != expected_worker_ids:
         state.attempt_count_exact = False
         if report_missing:
             missing = sorted(expected_worker_ids - state.done_workers)
-            unexpected = sorted(state.done_workers - expected_worker_ids)
-            details = []
-            if missing:
-                details.append(
-                    "missing " + ", ".join(str(worker_id) for worker_id in missing)
-                )
-            if unexpected:
-                details.append(
-                    "unexpected "
-                    + ", ".join(str(worker_id) for worker_id in unexpected)
-                )
-            state.errors.append("invalid worker completion set: " + "; ".join(details))
-
-
-def close_queue(out_q: mp.Queue) -> None:
-    try:
-        out_q.close()
-        out_q.join_thread()
-    except (OSError, ValueError):
-        pass
+            state.errors.append(f"missing worker completion messages: {missing}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1235,9 +1284,7 @@ def run_generation(
 ) -> int:
     """Run workers, validate a winner, and safely publish its identity."""
     staging: OutputStaging | None = None
-    stop_evt: mp.Event | None = None
-    out_q: mp.Queue | None = None
-    started_procs: list[mp.Process] = []
+    started_workers: list[WorkerHandle] = []
     state = SearchState()
     started_at: float | None = None
     workers_collected = False
@@ -1246,18 +1293,13 @@ def run_generation(
         nonlocal workers_collected
         if workers_collected:
             return
-        if stop_evt is not None:
-            stop_evt.set()
-        if stop_evt is not None and out_q is not None:
-            collect_worker_shutdown(
-                started_procs,
-                stop_evt,
-                out_q,
-                state,
-                prefix_hex,
-                postfix_hex,
-                report_missing=report_missing,
-            )
+        collect_worker_shutdown(
+            started_workers,
+            state,
+            prefix_hex,
+            postfix_hex,
+            report_missing=report_missing,
+        )
         workers_collected = True
 
     try:
@@ -1297,27 +1339,16 @@ def run_generation(
                 file=sys.stderr,
             )
 
-        process_context = mp.get_context("spawn")
-        stop_evt = process_context.Event()
-        out_q = process_context.Queue()
-        procs = [
-            process_context.Process(
-                target=worker,
-                args=(worker_id, prefix_hex, postfix_hex, stop_evt, out_q),
-                name=f"vanity-worker-{worker_id}",
-            )
-            for worker_id in range(workers)
-        ]
         started_at = time.perf_counter()
-
-        for proc in procs:
+        for worker_id in range(workers):
             signal_state.raise_if_requested()
-            proc.start()
-            started_procs.append(proc)
+            started_workers.append(start_worker(worker_id, prefix_hex, postfix_hex))
+            receive_worker_messages(started_workers, state, prefix_hex, postfix_hex, 0)
+            if state.match_private_key is not None or state.errors:
+                break
 
         wait_for_search_trigger(
-            started_procs,
-            out_q,
+            started_workers,
             state,
             prefix_hex,
             postfix_hex,
@@ -1436,8 +1467,11 @@ def run_generation(
                     f"WARNING: final worker cleanup failed: {shutdown_exc}",
                     file=sys.stderr,
                 )
-        if out_q is not None:
-            close_queue(out_q)
+        for handle in started_workers:
+            handle.cancel.close()
+            handle.messages.close()
+            if not handle.process.is_alive():
+                handle.process.close()
         if staging is not None:
             recovery_path = staging.cleanup()
             if recovery_path is not None:

@@ -3,7 +3,6 @@ import errno
 import hashlib
 import io
 import os
-import queue
 import signal
 import stat
 import subprocess
@@ -640,90 +639,115 @@ class CLITests(unittest.TestCase):
 
 
 class WorkerLifecycleTests(unittest.TestCase):
-    class FakeProcess:
-        def __init__(self, alive, exitcode):
-            self._alive = alive
-            self.exitcode = exitcode
+    def wait_until_ready(self, workers, state):
+        deadline = time.monotonic() + 10
+        while len(state.ready_workers) < len(workers) and time.monotonic() < deadline:
+            main.receive_worker_messages(workers, state, "0" * 32, "", 0.1)
+            self.assertFalse(state.errors)
+        self.assertEqual(len(state.ready_workers), len(workers))
 
-        def is_alive(self):
-            return self._alive
-
-    class EmptyQueue:
-        def get(self, timeout):
-            raise queue.Empty
-
-    class BusyQueue:
-        def __init__(self):
-            self.calls = 0
-
-        def get(self, timeout):
-            self.calls += 1
-            return (main.MSG_PROGRESS, 1, 1)
-
-    class StopEvent:
-        def set(self):
-            pass
-
-    class UnstoppableProcess:
-        name = "unstoppable"
-        exitcode = None
-
-        def is_alive(self):
-            return True
-
-        def join(self, timeout):
-            pass
-
-        def kill(self):
-            pass
-
-    def test_partial_hard_worker_exit_is_detected(self):
-        state = main.SearchState()
-        procs = [self.FakeProcess(False, 9), self.FakeProcess(True, None)]
-        with mock.patch.object(main, "WORKER_EXIT_GRACE", 0):
-            main.wait_for_search_trigger(
-                procs,
-                self.EmptyQueue(),
-                state,
-                "a",
-                "",
-                0.0,
-                16,
+    def close_workers(self, workers, state):
+        try:
+            main.collect_worker_shutdown(
+                workers, state, "0" * 32, "", report_missing=False
             )
-        self.assertRegex(state.errors[0], "worker 0 exited unexpectedly.*code 9")
+        finally:
+            for handle in workers:
+                handle.cancel.close()
+                handle.messages.close()
+                if handle.process.is_alive():
+                    handle.process.kill()
+                    handle.process.join(timeout=5)
+                handle.process.close()
 
-    def test_hard_worker_exit_is_detected_while_queue_stays_busy(self):
+    def test_real_hard_exit_is_detected_and_other_worker_stops(self):
+        workers = []
         state = main.SearchState()
-        procs = [self.FakeProcess(False, 9), self.FakeProcess(True, None)]
-        busy_queue = self.BusyQueue()
-        with (
-            mock.patch.object(main, "WORKER_EXIT_GRACE", 0),
-            mock.patch.object(main, "WORKER_HEALTH_INTERVAL", 0),
-        ):
-            main.wait_for_search_trigger(
-                procs,
-                busy_queue,
-                state,
-                "a",
-                "",
-                0.0,
-                16,
-            )
-        self.assertEqual(busy_queue.calls, 1)
-        self.assertRegex(state.errors[0], "worker 0 exited unexpectedly.*code 9")
+        try:
+            for worker_id in range(2):
+                workers.append(main.start_worker(worker_id, "0" * 32, ""))
+            self.wait_until_ready(workers, state)
+            workers[0].process.kill()
+            workers[0].process.join(timeout=5)
+            deadline = time.monotonic() + 3
+            while not state.errors and time.monotonic() < deadline:
+                main.receive_worker_messages(workers, state, "0" * 32, "", 0.1)
+            self.assertTrue(state.errors, "hard worker exit was not detected")
+            started = time.monotonic()
+            main.collect_worker_shutdown(workers, state, "0" * 32, "")
+            self.assertLess(time.monotonic() - started, main.SHUTDOWN_TIMEOUT + 1)
+            self.assertFalse(any(handle.process.is_alive() for handle in workers))
+            self.assertFalse(state.attempt_count_exact)
+        finally:
+            self.close_workers(workers, state)
+
+    def test_cancellation_pipe_eof_stops_active_worker(self):
+        workers = [main.start_worker(0, "0" * 32, "")]
+        state = main.SearchState()
+        try:
+            self.wait_until_ready(workers, state)
+            # This is also the EOF observed when the sole writer (parent) dies.
+            workers[0].cancel.close()
+            deadline = time.monotonic() + 5
+            while not state.done_workers and time.monotonic() < deadline:
+                main.receive_worker_messages(workers, state, "0" * 32, "", 0.1)
+            self.assertEqual(state.done_workers, {0})
+            self.assertFalse(state.errors)
+        finally:
+            self.close_workers(workers, state)
 
     def test_shutdown_refuses_to_continue_with_live_worker(self):
-        state = main.SearchState()
+        process = mock.Mock(name="process")
+        process.name = "unstoppable"
+        process.is_alive.return_value = True
+        messages = mock.Mock()
+        messages.closed = True
+        handle = main.WorkerHandle(process, messages, mock.Mock())
         with mock.patch.object(main, "SHUTDOWN_TIMEOUT", 0):
             with self.assertRaisesRegex(RuntimeError, "did not stop"):
-                main.collect_worker_shutdown(
-                    [self.UnstoppableProcess()],
-                    self.StopEvent(),
-                    self.EmptyQueue(),
-                    state,
-                    "a",
-                    "",
-                )
+                main.collect_worker_shutdown([handle], main.SearchState(), "a", "")
+
+    def test_worker_messages_are_bounded_and_invalid_json_is_rejected(self):
+        context = main.mp.get_context("spawn")
+        reader, writer = context.Pipe(duplex=False)
+        state = main.SearchState()
+        handle = main.WorkerHandle(mock.Mock(), reader, mock.Mock())
+        try:
+            with self.assertRaisesRegex(ValueError, "frame limit"):
+                main.send_worker_message(writer, (main.MSG_ERROR, 0, "x" * 1000))
+            writer.send_bytes(b"not JSON")
+            main.receive_worker_messages([handle], state, "a", "", 1)
+            self.assertTrue(state.errors)
+            self.assertTrue(reader.closed)
+        finally:
+            reader.close()
+            writer.close()
+
+    def test_worker_error_with_control_characters_is_bounded_and_reported(self):
+        context = main.mp.get_context("spawn")
+        reader, writer = context.Pipe(duplex=False)
+        cancel_reader, cancel_writer = context.Pipe(duplex=False)
+        state = main.SearchState()
+        handle = main.WorkerHandle(mock.Mock(), reader, cancel_writer)
+        try:
+            with (
+                mock.patch.object(main.signal, "signal"),
+                mock.patch.object(
+                    main, "gen_identity", side_effect=RuntimeError("\n" * 1000)
+                ),
+            ):
+                main.worker(0, "a", "", cancel_reader, writer)
+            deadline = time.monotonic() + 3
+            while not state.done_workers and time.monotonic() < deadline:
+                main.receive_worker_messages([handle], state, "a", "", 0.1)
+            self.assertEqual(state.done_workers, {0})
+            self.assertIn("RuntimeError", state.errors[0])
+            self.assertNotIn("\n", state.errors[0])
+        finally:
+            reader.close()
+            writer.close()
+            cancel_reader.close()
+            cancel_writer.close()
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX signal semantics required")
@@ -731,49 +755,46 @@ class SignalIntegrationTests(unittest.TestCase):
     def run_until_signal(self, requested_signal, expected_exit_code):
         with tempfile.TemporaryDirectory() as directory:
             output_path = os.path.join(directory, "identity")
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    os.path.abspath(main.__file__),
-                    "--prefix",
-                    "0" * 32,
-                    "--force",
-                    "--workers",
-                    "1",
-                    "--out",
-                    output_path,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            try:
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    staging_files = [
-                        name
-                        for name in os.listdir(directory)
-                        if name.startswith(main.OUTPUT_STAGING_PREFIX)
-                    ]
-                    if staging_files:
-                        break
-                    if process.poll() is not None:
-                        break
-                    time.sleep(0.02)
-
-                self.assertIsNone(process.poll(), "generator exited before signal")
-                self.assertTrue(staging_files, "output preflight did not complete")
-                process.send_signal(requested_signal)
-                stdout, stderr = process.communicate(timeout=15)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.communicate()
-
+            with open(
+                os.path.join(directory, "stderr.log"), "w+", encoding="utf-8"
+            ) as log:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        os.path.abspath(main.__file__),
+                        "--prefix",
+                        "0" * 32,
+                        "--force",
+                        "--workers",
+                        "2",
+                        "--out",
+                        output_path,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=log,
+                    text=True,
+                )
+                try:
+                    deadline = time.monotonic() + 10
+                    stderr = ""
+                    while time.monotonic() < deadline:
+                        log.seek(0)
+                        stderr = log.read()
+                        if "[ready] workers=2" in stderr or process.poll() is not None:
+                            break
+                        time.sleep(0.02)
+                    self.assertIsNone(process.poll(), stderr)
+                    self.assertIn("[ready] workers=2", stderr)
+                    process.send_signal(requested_signal)
+                    stdout, _ = process.communicate(timeout=15)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate(timeout=5)
+                log.seek(0)
+                stderr = log.read()
             self.assertEqual(
-                process.returncode,
-                expected_exit_code,
-                f"stdout={stdout!r}\nstderr={stderr!r}",
+                process.returncode, expected_exit_code, f"{stdout!r} {stderr!r}"
             )
             self.assertFalse(os.path.lexists(output_path))
             self.assertFalse(
