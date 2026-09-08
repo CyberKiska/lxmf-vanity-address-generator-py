@@ -100,8 +100,15 @@ class RNSCompatibilityTests(unittest.TestCase):
         )
         self.assertEqual(validated, (private_key, address))
 
-        error = main.validate_match_payload(private_key, address, "ff", "")
+        wrong_prefix = "0" if address[0] != "0" else "1"
+        error = main.validate_match_payload(private_key, address, wrong_prefix, "")
         self.assertIsInstance(error, str)
+
+    def test_public_compatibility_vector_matches_independent_formula(self):
+        identity_hash = hashlib.sha256(main.COMPAT_PUBLIC_KEY).digest()[:16]
+        name_hash = hashlib.sha256(b"lxmf.delivery").digest()[:10]
+        expected = hashlib.sha256(name_hash + identity_hash).digest()[:16].hex()
+        self.assertEqual(main.COMPAT_LXMF_HASH, expected)
 
 
 class WorkerMessageTests(unittest.TestCase):
@@ -548,6 +555,12 @@ class CLITests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "derivation is incompatible"):
                 main.validate_runtime_environment()
 
+    def test_runtime_rejects_shared_hash_helper_regression(self):
+        # Both public helpers delegate to hash(); agreement alone is insufficient.
+        with mock.patch.object(main.RNS.Destination, "hash", return_value=bytes(16)):
+            with self.assertRaisesRegex(ValueError, "derivation is incompatible"):
+                main.validate_runtime_environment()
+
     def test_invalid_cli_is_reported_before_runtime_self_test(self):
         stderr = io.StringIO()
         with (
@@ -791,6 +804,8 @@ class SignalIntegrationTests(unittest.TestCase):
                     if process.poll() is None:
                         process.kill()
                         process.communicate(timeout=5)
+                    if process.stdout is not None:
+                        process.stdout.close()
                 log.seek(0)
                 stderr = log.read()
             self.assertEqual(
