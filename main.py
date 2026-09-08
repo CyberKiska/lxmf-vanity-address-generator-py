@@ -568,6 +568,7 @@ class OutputStaging:
         # an asynchronous exception could arrive after some key bytes are
         # written but before Python regains control.
         self.may_contain_private_key = True
+        self.private_key_verified = False
         try:
             os.lseek(self.fd, 0, os.SEEK_SET)
             _write_all(self.fd, private_key)
@@ -590,6 +591,32 @@ class OutputStaging:
             ) from exc
 
         self.private_key_verified = True
+
+    def write_and_publish(self, private_key: bytes, expected_address: str) -> str:
+        """Share the exact key/address verification used by the CLI and helper."""
+        self.write_private_key(private_key)
+        saved_path = self.publish()
+        try:
+            reloaded = RNS.Identity.from_file(saved_path)
+            if (
+                reloaded is None
+                or reloaded.get_private_key() != private_key
+                or lxmf_hash_hex_for_identity(reloaded) != expected_address
+            ):
+                raise ValueError(
+                    "saved identity does not reproduce the winning key and address"
+                )
+        except Exception as exc:
+            removed = self.remove_published_final()
+            cleanup = (
+                "removed invalid final output"
+                if removed
+                else f"could not remove {saved_path!r}"
+            )
+            raise OutputWriteError(
+                f"Output verification failed; {cleanup}: {exc}"
+            ) from exc
+        return saved_path
 
     def publish(self) -> str:
         if not self.private_key_verified:
@@ -805,16 +832,18 @@ def secure_write_identity(path: str, private_key_bytes: bytes) -> str:
         raise OutputWriteError(str(exc)) from exc
 
     try:
-        staging.write_private_key(private_key)
-        saved_path = staging.publish()
-        reloaded = RNS.Identity.from_file(saved_path)
-        if reloaded is None or reloaded.get_private_key() != private_key:
-            removed = staging.remove_published_final()
-            cleanup = "removed invalid output" if removed else "could not remove output"
-            raise OutputWriteError(
-                f"Published identity verification failed; {cleanup}."
+        identity = RNS.Identity.from_bytes(private_key)
+        if identity is None:
+            raise OutputWriteError("could not reconstruct the identity")
+        saved_path = staging.write_and_publish(
+            private_key, lxmf_hash_hex_for_identity(identity)
+        )
+        extra_private_path = staging.finalize()
+        if extra_private_path is not None:
+            print(
+                f"WARNING: additional private-key link remains at {extra_private_path!r}.",
+                file=sys.stderr,
             )
-        staging.finalize()
         return saved_path
     except Exception as exc:
         recovery_path = staging.cleanup()
@@ -1406,30 +1435,9 @@ def run_generation(
         ):
             raise RuntimeError("final LXMF result validation failed")
 
-        staging.write_private_key(state.match_private_key)
-        saved_path = staging.publish()
-
-        try:
-            reloaded = RNS.Identity.from_file(saved_path)
-            if reloaded is None:
-                raise RuntimeError("saved identity could not be reloaded by RNS")
-            reloaded_addr_hex = lxmf_hash_hex_for_identity(reloaded)
-            if reloaded_addr_hex != state.match_addr_hex or not matches_vanity(
-                reloaded_addr_hex, prefix_hex, postfix_hex
-            ):
-                raise RuntimeError(
-                    "saved identity does not reproduce the requested LXMF address"
-                )
-        except Exception as exc:
-            removed = staging.remove_published_final()
-            cleanup = (
-                "removed invalid final output"
-                if removed
-                else f"could not remove final output {saved_path!r}"
-            )
-            raise OutputWriteError(
-                f"Output verification failed; {cleanup}: {exc}"
-            ) from exc
+        saved_path = staging.write_and_publish(
+            state.match_private_key, state.match_addr_hex
+        )
 
         extra_private_path = staging.finalize()
         if extra_private_path is not None:

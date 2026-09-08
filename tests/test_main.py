@@ -3,6 +3,7 @@ import errno
 import hashlib
 import io
 import os
+from pathlib import Path
 import signal
 import stat
 import subprocess
@@ -650,6 +651,65 @@ class CLITests(unittest.TestCase):
             identity = RNS.Identity.from_file(output_path)
             self.assertTrue(main.lxmf_hash_hex_for_identity(identity).endswith("a"))
 
+    def test_cli_publication_flush_failure_reports_recovery_without_success(self):
+        original_flush = main._fsync_directory
+        calls = 0
+
+        def fail_after_preflight(path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError(errno.EIO, "publication I/O failure")
+            return original_flush(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(
+                    main, "_fsync_directory", side_effect=fail_after_preflight
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = main.main(
+                    ["--prefix=a", "--workers=1", "--out=" + directory + "/identity"]
+                )
+            self.assertEqual(result, 1)
+            self.assertNotIn("Identity Found", stdout.getvalue())
+            self.assertIn("RECOVERY:", stderr.getvalue())
+            staging_paths = list(Path(directory).glob("*.staging"))
+            self.assertEqual(len(staging_paths), 1)
+            recovered = RNS.Identity.from_file(str(staging_paths[0]))
+            self.assertIsNotNone(recovered)
+            self.assertTrue(main.lxmf_hash_hex_for_identity(recovered).startswith("a"))
+
+    def test_cli_failed_final_verification_removes_final_and_preserves_staging(self):
+        original_load = RNS.Identity.from_file
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = os.path.join(directory, "identity")
+
+            def fail_final_load(path):
+                return None if path == output_path else original_load(path)
+
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(
+                    RNS.Identity, "from_file", side_effect=fail_final_load
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = main.main(
+                    ["--prefix=a", "--workers=1", "--out=" + output_path]
+                )
+            self.assertEqual(result, 1)
+            self.assertFalse(os.path.lexists(output_path))
+            self.assertIn("RECOVERY:", stderr.getvalue())
+            self.assertNotIn("Identity Found", stdout.getvalue())
+            recovery = list(Path(directory).glob("*.staging"))
+            self.assertEqual(len(recovery), 1)
+            self.assertIsNotNone(RNS.Identity.from_file(str(recovery[0])))
+
 
 class WorkerLifecycleTests(unittest.TestCase):
     def wait_until_ready(self, workers, state):
@@ -768,9 +828,8 @@ class SignalIntegrationTests(unittest.TestCase):
     def run_until_signal(self, requested_signal, expected_exit_code):
         with tempfile.TemporaryDirectory() as directory:
             output_path = os.path.join(directory, "identity")
-            with open(
-                os.path.join(directory, "stderr.log"), "w+", encoding="utf-8"
-            ) as log:
+            log_path = Path(directory) / "stderr.log"
+            with log_path.open("w", encoding="utf-8") as log:
                 process = subprocess.Popen(
                     [
                         sys.executable,
@@ -791,8 +850,7 @@ class SignalIntegrationTests(unittest.TestCase):
                     deadline = time.monotonic() + 10
                     stderr = ""
                     while time.monotonic() < deadline:
-                        log.seek(0)
-                        stderr = log.read()
+                        stderr = log_path.read_text(encoding="utf-8")
                         if "[ready] workers=2" in stderr or process.poll() is not None:
                             break
                         time.sleep(0.02)
@@ -806,8 +864,7 @@ class SignalIntegrationTests(unittest.TestCase):
                         process.communicate(timeout=5)
                     if process.stdout is not None:
                         process.stdout.close()
-                log.seek(0)
-                stderr = log.read()
+                stderr = log_path.read_text(encoding="utf-8")
             self.assertEqual(
                 process.returncode, expected_exit_code, f"{stdout!r} {stderr!r}"
             )
