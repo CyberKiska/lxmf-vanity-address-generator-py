@@ -3,6 +3,7 @@
 node_modules/
 .vscode/
 .idea/
+.venv/
 path/
 identity
 *.identity

@@ -181,10 +181,13 @@ def validate_runtime_environment() -> str:
         raise ValueError(
             f"invalid installed RNS version {installed_rns_text!r}"
         ) from exc
-    if not MIN_RNS_VERSION <= installed_rns < MAX_RNS_VERSION:
+    if (
+        installed_rns.is_prerelease
+        or not MIN_RNS_VERSION <= installed_rns < MAX_RNS_VERSION
+    ):
         raise ValueError(
             f"unsupported RNS version {installed_rns_text!r}; expected "
-            f">={MIN_RNS_VERSION},<{MAX_RNS_VERSION}"
+            f">={MIN_RNS_VERSION},<{MAX_RNS_VERSION} (stable releases)"
         )
 
     try:
@@ -202,10 +205,10 @@ def validate_runtime_environment() -> str:
         raise ValueError(
             f"invalid installed cryptography version {installed_crypto_text!r}"
         ) from exc
-    if installed_crypto < MIN_CRYPTOGRAPHY_VERSION:
+    if installed_crypto.is_prerelease or installed_crypto < MIN_CRYPTOGRAPHY_VERSION:
         raise ValueError(
             f"unsupported cryptography version {installed_crypto_text!r}; "
-            f"expected >={MIN_CRYPTOGRAPHY_VERSION}"
+            f"expected >={MIN_CRYPTOGRAPHY_VERSION} (stable releases)"
         )
 
     if RNS.Reticulum.TRUNCATED_HASHLENGTH != 128:
@@ -1249,6 +1252,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workers",
         type=int,
+        metavar="NUMBER_OF_PROCESSES",
         default=workers_default,
         help=f"Worker processes to run in parallel (default: {workers_default}).",
     )
@@ -1420,8 +1424,8 @@ def run_generation(
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
 
-        # A valid, independently verified match remains useful if another
-        # worker failed only while coordinated shutdown was already underway.
+        # Preserve a verified winner even if another worker failed. All workers
+        # have stopped before any private output is published.
         for error in state.errors:
             print(f"WARNING: {error}", file=sys.stderr)
 

@@ -4,8 +4,8 @@ A security-focused command-line generator for a Reticulum identity whose final
 `lxmf.delivery` destination hash has a chosen hexadecimal prefix, postfix, or
 both.
 
-This release is tested with the current **Reticulum 1.4.2** release and accepts
-compatible Reticulum 1.x updates. It uses the official public API for key
+This release is tested with **Reticulum 1.4.2 and 1.5.2** and accepts compatible
+Reticulum 1.x updates. It uses the official public API for key
 generation and address derivation:
 
 ```python
@@ -31,13 +31,21 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt` requires `rns>=1.4.2,<2.0` and a non-vulnerable PyCA
+`requirements.txt` requires `rns>=1.4.2,<2.0` and PyCA
 `cryptography>=50.0.0` instead of locking the application to one patch release.
-At startup, the generator rejects local package shadowing and runs a public-API
-semantic self-test: it creates and serializes an identity, reconstructs it, and
-confirms that both official destination-hash helpers produce the same canonical
-`lxmf.delivery` address. This gives compatible updates room to install while
-failing closed if an update changes a relied-on API or serialization invariant.
+Runtime version checks accept stable releases; development and release-candidate
+versions are rejected, including candidates for the next major RNS version.
+At startup, the generator checks package origins, verifies both destination-hash
+helpers against a fixed public-key/address vector, and checks generated identities
+through private/public serialization round trips. The expected address was derived
+independently from the reference hash formula. This checks the relied-on protocol
+semantics while allowing compatible updates.
+
+Origin checks detect accidental package shadowing after import; they cannot
+protect against malicious import-time code or a modified Python environment.
+Use a trusted environment and install dependencies from trusted sources. Package
+version checks also do not establish which cryptographic backend a modified RNS
+build actually uses. Production key generation stays within `RNS.Identity()`.
 
 For reproducible deployments, resolve these ranges into an environment lock or
 artifact manifest after the release checks pass. Re-run the suite whenever the
@@ -86,7 +94,8 @@ and cryptographic backend implementations.
 - Odd lengths are valid and constrain individual hexadecimal nibbles.
 - Prefix and postfix may overlap. A compatible overlap is accepted; a
   contradictory overlap is rejected before workers start.
-- Empty strings, whitespace, `0x` notation, non-ASCII lookalikes, invalid hex,
+- An empty pattern is treated as absent; both patterns cannot be empty.
+- Whitespace, `0x` notation, non-ASCII lookalikes, invalid hex,
   contradictory overlap, and patterns longer than 32 characters are rejected.
 - Searches constraining more than six distinct hex positions require
   `--force`. This guard prevents accidental searches with a nominal mean above
@@ -122,10 +131,15 @@ Hard-link publication is atomic and no-overwrite on filesystems that support
 it. A portable exclusive-create fallback retains no-overwrite behavior where
 hard links are unavailable, although the final name can briefly be visible
 while its 64 bytes are written. Directory metadata is flushed where the
-platform supports it.
+platform supports it. Unsupported directory flushing produces a warning before
+generation. Actual storage or permission errors fail the operation; they are
+never silently treated as an unsupported feature.
 
-If a late publication or verification error occurs, the winning private key is
-kept in the staging file and its path is printed as `RECOVERY:`. Treat every
+If publication or verification fails, the winning private key is kept in staging
+and its path is printed as `RECOVERY:`. If flushing staging-name removal fails
+after the final identity has already been committed, the error identifies the
+saved final file instead. A failed run can therefore leave an identity at the
+requested path; inspect the reported paths before retrying. Treat every
 file named `.lxmf-identity-*.staging` as secret: a force kill, power loss, or
 process crash can leave either a harmless preflight marker or private key
 material there. A leftover `.lxmf-identity-*.probe` contains no private key.
@@ -156,23 +170,34 @@ If `k` distinct hexadecimal positions are constrained, the nominal mean is
 `16^k` generated identities. Each additional position increases the expected
 work by 16 times. Prefix/postfix overlap is counted once.
 
-The default worker count follows the CPU quota visible to the process and is
-clamped to 32 to avoid surprising memory use on very large hosts. Explicit
-values are limited to twice the available CPU count, capped at 256. More workers
+The default worker count uses the available logical CPU count, respecting CPU
+affinity where Python exposes it, and is capped at 32. This does not measure
+cgroup CPU bandwidth quotas; set `--workers` explicitly in quota-limited
+containers. Explicit values are limited to twice the available CPU count, capped
+at 256. More workers
 can reduce performance through scheduling, memory pressure, or thermal
 throttling, so benchmark on the deployment host.
 
-Workers batch progress messages to keep inter-process overhead out of the hot
-loop. The parent validates all worker messages and independently reconstructs
-any claimed winner. A worker that exits without its completion message is
-reported as a runtime failure—even while the progress queue remains
-continuously busy—instead of allowing the search to run silently at reduced
-capacity.
+Workers report progress every 1,024 attempts and check cancellation every 64
+attempts, avoiding shared synchronization on every generated identity. Each
+worker has separate result and cancellation pipes. Result messages use bounded
+JSON frames, and the parent independently reconstructs any claimed winner.
+Worker failure is isolated to that worker's pipe and is detected even while
+other workers are reporting progress. A verified match can still be saved if
+another worker fails, with the failure reported as a warning.
+
+The parent cancels workers by closing its cancellation writers. Workers also
+observe this EOF if the parent crashes, so an active search does not depend on
+the parent running its cleanup handler. Pipe buffers provide backpressure rather
+than allowing an unbounded progress queue to grow. All workers share a five-second
+shutdown deadline, followed by forced termination and a one-second join deadline.
 
 Workers use Python's clean `spawn` process context on every platform. This has
 a small startup cost, but avoids inheriting the private output descriptor or
-forking live cryptographic library state. The parent refuses to publish a key
-unless all workers have stopped, including after forced shutdown.
+forking live cryptographic library state. Startup stops launching additional
+workers when a result or failure is already available. A `[ready]` message on
+`stderr` confirms that the started workers are active. The parent refuses to
+publish a key unless all workers have stopped, including after forced shutdown.
 
 On POSIX systems, Ctrl+C and SIGTERM request coordinated shutdown. Signals are
 handled at safe checkpoints so they cannot split private-key filesystem
@@ -203,13 +228,15 @@ python -m bandit -q -r main.py
 python -m pip_audit --requirement requirements.txt --progress-spinner off
 ```
 
-The 56-test suite includes independent hash-formula checks, official helper
-equivalence, canonical prefix/postfix AND matching, compatible and conflicting
-overlap cases, real postfix-only and two-process searches, worker protocol and
-hard-exit handling, output races, publication fallbacks, interruption rollback,
-privacy-by-default output, and real SIGINT/SIGTERM subprocess tests.
+The suite includes an independent public compatibility vector, reference-formula
+checks, exact prefix/postfix matching, overlap validation, real multiprocess
+searches, worker termination and cancellation EOF, malformed messages, output
+races, publication fallbacks, injected storage failures, recovery, and privacy
+checks. SIGINT/SIGTERM integration tests wait for active workers before signalling.
 
 The GitHub Actions workflow repeats these quality checks and runs the functional
-suite on Python 3.10 under Linux and Python 3.14 under Linux, macOS, and Windows.
-Official actions are pinned to the immutable commit hashes of their latest
-releases. Require the complete workflow to pass before publishing a release.
+suite against both RNS 1.4.2 and the latest allowed RNS 1.x release on Python 3.10
+under Linux and Python 3.14 under Linux, macOS, and Windows. Official actions are
+pinned to immutable commit hashes. Require the complete workflow to pass before
+publishing a release. A clean dependency audit covers the resolved versions at
+that time; it does not guarantee that every version in the allowed ranges is safe.

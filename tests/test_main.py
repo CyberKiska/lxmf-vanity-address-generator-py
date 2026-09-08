@@ -26,6 +26,30 @@ class PatternValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hex characters only"):
             main.normalize_and_validate_patterns("0x12", "")
 
+    def test_invalid_patterns_are_rejected_on_either_side(self):
+        for value in (
+            " ",
+            "a ",
+            "\na",
+            "0x1",
+            "aa:bb",
+            "g",
+            "Ａ",
+            "𝒜",
+            "é",
+            "\0",
+            "a" * 33,
+            None,
+        ):
+            for prefix, postfix in ((value, "a"), ("a", value)):
+                with self.subTest(prefix=prefix, postfix=postfix):
+                    with self.assertRaises(ValueError):
+                        main.normalize_and_validate_patterns(prefix, postfix)
+
+    def test_one_empty_pattern_is_treated_as_absent(self):
+        self.assertEqual(main.normalize_and_validate_patterns("", "A"), ("", "a"))
+        self.assertEqual(main.normalize_and_validate_patterns("A", ""), ("a", ""))
+
     def test_both_empty_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "at least one"):
             main.normalize_and_validate_patterns("", "")
@@ -195,6 +219,17 @@ class SecureOutputTests(unittest.TestCase):
 
             with open(path, "rb") as handle:
                 self.assertEqual(handle.read(), original)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlink semantics required")
+    def test_secure_write_refuses_a_dangling_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "identity")
+            target = os.path.join(directory, "missing")
+            os.symlink(target, path)
+            with self.assertRaisesRegex(main.OutputWriteError, "Refusing to overwrite"):
+                main.secure_write_identity(path, self.private_key)
+            self.assertTrue(os.path.islink(path))
+            self.assertFalse(os.path.exists(target))
 
     @unittest.skipUnless(os.name == "posix", "POSIX directory fsync required")
     def test_directory_io_failure_aborts_preflight(self):
@@ -539,6 +574,18 @@ class CLITests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "expected >=50.0.0"):
                 main.validate_runtime_environment()
 
+    def test_runtime_rejects_prerelease_dependencies(self):
+        for value in ("1.6.0rc1", "2.0.0rc1", "2.0.dev0"):
+            with (
+                self.subTest(version=value),
+                mock.patch.object(main, "rns_version", return_value=value),
+            ):
+                with self.assertRaisesRegex(ValueError, "stable releases"):
+                    main.validate_runtime_environment()
+        with mock.patch.object(main, "cryptography_version", return_value="51.0.0rc1"):
+            with self.assertRaisesRegex(ValueError, "stable releases"):
+                main.validate_runtime_environment()
+
     def test_runtime_rejects_shadowed_rns_import(self):
         with mock.patch.object(main.RNS, "__file__", "/tmp/shadowed/RNS.py"):
             with self.assertRaisesRegex(ValueError, "does not come from"):
@@ -712,6 +759,39 @@ class CLITests(unittest.TestCase):
 
 
 class WorkerLifecycleTests(unittest.TestCase):
+    def test_partial_startup_failure_cleans_up_started_workers(self):
+        original_start = main.start_worker
+        started_pids = []
+
+        def fail_second_start(worker_id, prefix, postfix):
+            if worker_id == 1:
+                raise OSError("synthetic process startup failure")
+            handle = original_start(worker_id, prefix, postfix)
+            started_pids.append(handle.process.pid)
+            return handle
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(main, "start_worker", side_effect=fail_second_start),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                result = main.main(
+                    [
+                        "--prefix=" + "0" * 32,
+                        "--force",
+                        "--workers=2",
+                        "--out=" + directory + "/identity",
+                    ]
+                )
+            self.assertEqual(result, 1)
+            self.assertEqual(len(started_pids), 1)
+            self.assertFalse(
+                set(started_pids)
+                & {process.pid for process in main.mp.active_children()}
+            )
+            self.assertEqual(os.listdir(directory), [])
+
     def wait_until_ready(self, workers, state):
         deadline = time.monotonic() + 10
         while len(state.ready_workers) < len(workers) and time.monotonic() < deadline:
