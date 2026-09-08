@@ -325,23 +325,27 @@ def validate_output_path(path: str) -> str:
     return abs_path
 
 
-def _fsync_directory(path: str) -> None:
+def _fsync_directory(path: str) -> bool:
+    """Flush directory metadata, tolerating only known unsupported operations."""
+    if os.name == "nt":
+        # Windows does not expose directory fsync through these POSIX APIs.
+        return False
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
 
+    directory_fd = -1
     try:
         directory_fd = os.open(path, flags)
-    except OSError:
-        return
-
-    try:
         os.fsync(directory_fd)
-    except OSError:
-        # Some platforms and filesystems do not support directory fsync.
-        pass
+        return True
+    except OSError as exc:
+        if exc.errno in {errno.EINVAL, errno.ENOTSUP, errno.ENOSYS}:
+            return False
+        raise
     finally:
-        os.close(directory_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
 
 def _validate_private_key_bytes(private_key_bytes: object) -> bytes:
@@ -653,7 +657,13 @@ class OutputStaging:
             return self.staging_path
         self.finalized = True
         self.staging_path = ""
-        _fsync_directory(self.parent)
+        try:
+            _fsync_directory(self.parent)
+        except OSError as exc:
+            raise OutputWriteError(
+                f"Identity is saved at {self.final_path!r}, but removal of the "
+                f"staging name could not be durably flushed: {exc}"
+            ) from exc
         return None
 
     def cleanup(self) -> str | None:
@@ -720,7 +730,12 @@ def prepare_output_staging(path: str) -> OutputStaging:
             publish_mode = PUBLISH_HARD_LINK
         probe_path = None
 
-        _fsync_directory(parent)
+        if not _fsync_directory(parent):
+            print(
+                "WARNING: directory metadata flushing is unavailable; file "
+                "contents will be flushed, but crash durability is limited.",
+                file=sys.stderr,
+            )
         if staging_path is None or staging_inode is None:
             raise ValueError("output staging was not initialized")
         return OutputStaging(

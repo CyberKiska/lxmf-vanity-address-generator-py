@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import hashlib
 import io
 import os
@@ -187,6 +188,66 @@ class SecureOutputTests(unittest.TestCase):
 
             with open(path, "rb") as handle:
                 self.assertEqual(handle.read(), original)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX directory fsync required")
+    def test_directory_io_failure_aborts_preflight(self):
+        real_fsync = os.fsync
+
+        def fail_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "directory I/O failure")
+            return real_fsync(fd)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(os, "fsync", side_effect=fail_directory):
+                with self.assertRaisesRegex(ValueError, "directory I/O failure"):
+                    main.prepare_output_staging(os.path.join(directory, "identity"))
+            self.assertEqual(os.listdir(directory), [])
+
+    def test_publication_flush_failure_preserves_recoverable_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "identity")
+            staging = main.prepare_output_staging(path)
+            staging.write_private_key(self.private_key)
+            with mock.patch.object(
+                main, "_fsync_directory", side_effect=OSError(errno.EIO, "I/O failure")
+            ):
+                with self.assertRaises(OSError):
+                    staging.publish()
+            recovery = staging.cleanup()
+            self.assertIsNotNone(recovery)
+            self.assertEqual(
+                RNS.Identity.from_file(recovery).get_private_key(), self.private_key
+            )
+
+    def test_finalize_flush_failure_reports_saved_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "identity")
+            staging = main.prepare_output_staging(path)
+            staging.write_private_key(self.private_key)
+            staging.publish()
+            with mock.patch.object(
+                main, "_fsync_directory", side_effect=OSError(errno.EIO, "I/O failure")
+            ):
+                with self.assertRaisesRegex(main.OutputWriteError, "Identity is saved"):
+                    staging.finalize()
+            self.assertEqual(
+                RNS.Identity.from_file(path).get_private_key(), self.private_key
+            )
+            self.assertIsNone(staging.cleanup())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX directory fsync required")
+    def test_only_unsupported_directory_flush_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                os, "fsync", side_effect=OSError(errno.EINVAL, "unsupported")
+            ):
+                self.assertFalse(main._fsync_directory(directory))
+            with mock.patch.object(
+                os, "open", side_effect=PermissionError(errno.EACCES, "denied")
+            ):
+                with self.assertRaises(PermissionError):
+                    main._fsync_directory(directory)
 
     def test_secure_write_rejects_wrong_key_length(self):
         with tempfile.TemporaryDirectory() as directory:
