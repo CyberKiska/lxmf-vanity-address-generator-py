@@ -3,11 +3,10 @@
 ## Supported scope
 
 Security fixes are prepared for the current default branch and runtime versions
-allowed by `requirements.txt`. Local release checks cover RNS 1.4.2 and 1.5.2
-with PyCA cryptography 50.0.1; CI tests the RNS compatibility floor and latest
-allowed release across supported operating systems. Older commits, modified
-builds, and dependency versions outside the declared ranges are outside the
-reviewed configuration.
+allowed by `requirements.txt`, with RNS 1.5.2 as the minimum supported release.
+CI tests the latest allowed RNS release on Python 3.14 across Linux, macOS,
+and Windows. Older commits, modified builds, and dependency versions outside
+the declared ranges are outside the reviewed configuration.
 
 ## Reporting a vulnerability
 

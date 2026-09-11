@@ -33,7 +33,7 @@ except ImportError as exc:  # pragma: no cover - exercised without the dependenc
 
 LXMF_APP_NAME = "lxmf"
 LXMF_ASPECTS = ("delivery",)
-MIN_RNS_VERSION = Version("1.4.2")
+MIN_RNS_VERSION = Version("1.5.2")
 MAX_RNS_VERSION = Version("2.0")
 MIN_CRYPTOGRAPHY_VERSION = Version("50.0.0")
 DEST_HASH_HEX_LEN = 32
@@ -224,7 +224,7 @@ def validate_runtime_environment() -> str:
 
     try:
         known_identity = RNS.Identity(create_keys=False)
-        # RNS 1.4.2 returns None on success; verify the exported key itself.
+        # Verify the exported key as well as the API's return value.
         loaded = known_identity.load_public_key(COMPAT_PUBLIC_KEY)
         if loaded is False or known_identity.get_public_key() != COMPAT_PUBLIC_KEY:
             raise ValueError("RNS could not load the public compatibility fixture")

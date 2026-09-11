@@ -564,11 +564,11 @@ class CLITests(unittest.TestCase):
         self.assertIn("PyCA cryptography", description)
 
     def test_runtime_enforces_supported_version_ranges(self):
-        with mock.patch.object(main, "rns_version", return_value="1.4.1"):
-            with self.assertRaisesRegex(ValueError, "expected >=1.4.2,<2.0"):
+        with mock.patch.object(main, "rns_version", return_value="1.5.1"):
+            with self.assertRaisesRegex(ValueError, "expected >=1.5.2,<2.0"):
                 main.validate_runtime_environment()
         with mock.patch.object(main, "rns_version", return_value="2.0.0"):
-            with self.assertRaisesRegex(ValueError, "expected >=1.4.2,<2.0"):
+            with self.assertRaisesRegex(ValueError, "expected >=1.5.2,<2.0"):
                 main.validate_runtime_environment()
         with mock.patch.object(main, "cryptography_version", return_value="49.0.0"):
             with self.assertRaisesRegex(ValueError, "expected >=50.0.0"):

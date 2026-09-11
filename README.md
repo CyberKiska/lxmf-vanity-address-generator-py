@@ -4,8 +4,8 @@ A security-focused command-line generator for a Reticulum identity whose final
 `lxmf.delivery` destination hash has a chosen hexadecimal prefix, postfix, or
 both.
 
-This release is tested with **Reticulum 1.4.2 and 1.5.2** and accepts compatible
-Reticulum 1.x updates. It uses the official public API for key
+This release uses **Reticulum 1.5.2** as its compatibility baseline and accepts
+compatible Reticulum 1.x updates. It uses the official public API for key
 generation and address derivation:
 
 ```python
@@ -22,7 +22,7 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting guidance.
 
 ## Installation
 
-Use Python 3.10 or newer in an isolated environment:
+Use Python 3.14 in an isolated environment:
 
 ```sh
 python3 -m venv .venv
@@ -31,7 +31,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt` requires `rns>=1.4.2,<2.0` and PyCA
+`requirements.txt` requires `rns>=1.5.2,<2.0` and PyCA
 `cryptography>=50.0.0` instead of locking the application to one patch release.
 Runtime version checks accept stable releases; development and release-candidate
 versions are rejected, including candidates for the next major RNS version.
@@ -235,8 +235,8 @@ races, publication fallbacks, injected storage failures, recovery, and privacy
 checks. SIGINT/SIGTERM integration tests wait for active workers before signalling.
 
 The GitHub Actions workflow repeats these quality checks and runs the functional
-suite against both RNS 1.4.2 and the latest allowed RNS 1.x release on Python 3.10
-under Linux and Python 3.14 under Linux, macOS, and Windows. Official actions are
+suite against the latest allowed RNS 1.x release on Python 3.14 under Linux,
+macOS, and Windows. Official actions are
 pinned to immutable commit hashes. Require the complete workflow to pass before
 publishing a release. A clean dependency audit covers the resolved versions at
 that time; it does not guarantee that every version in the allowed ranges is safe.
