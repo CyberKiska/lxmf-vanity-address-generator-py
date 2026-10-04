@@ -312,6 +312,39 @@ class MatchPreservationTests(unittest.TestCase):
             self.assertIn("could not be written to stdout", stderr.getvalue())
             self.assert_saved(directory)
 
+    # T1.3
+    def test_interrupted_wait_becomes_coordinated_sigint(self):
+        real_wait = main.wait
+        fired = []
+
+        def interrupted_wait(object_list, timeout=None):
+            if not fired:
+                fired.append(True)
+                # What CPython does on Windows when Ctrl+C lands in the wait.
+                signal.raise_signal(signal.SIGINT)
+                raise InterruptedError(errno.EINTR, "Interrupted function call")
+            return real_wait(object_list, timeout)
+
+        with tempfile.TemporaryDirectory() as directory:
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(main, "wait", side_effect=interrupted_wait),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = main.main(
+                    [
+                        "--prefix=" + "0" * 32,
+                        "--force",
+                        "--workers=1",
+                        "--out=" + directory + "/identity",
+                    ]
+                )
+            self.assertEqual(result, 130, stderr.getvalue())
+            self.assertIn("Interrupted", stderr.getvalue())
+            self.assertNotIn("ERROR", stderr.getvalue())
+            self.assertEqual(os.listdir(directory), [])
+
 
 class StreamReliabilityTests(unittest.TestCase):
     def test_real_closed_pipes_do_not_change_saved_success(self):
@@ -405,3 +438,32 @@ class StreamReliabilityTests(unittest.TestCase):
                 main.print_diagnostic("ключ")
         finally:
             stream.close()
+
+
+class InterruptedWaitTests(unittest.TestCase):
+    def test_eintr_without_signal_resumes_without_manufacturing_interrupt(self):
+        context = main.mp.get_context("spawn")
+        reader, writer = context.Pipe(duplex=False)
+        handle = main.WorkerHandle(mock.Mock(), reader, mock.Mock())
+        state = main.SearchState()
+        try:
+            main.send_worker_message(writer, (main.MSG_READY, 0))
+            with mock.patch.object(
+                main, "wait", side_effect=InterruptedError(errno.EINTR, "interrupted")
+            ):
+                main.receive_worker_messages([handle], state, "a", "", 0)
+            self.assertFalse(state.ready_workers)
+            main.receive_worker_messages([handle], state, "a", "", 1)
+            self.assertEqual(state.ready_workers, {0})
+            self.assertFalse(state.errors)
+        finally:
+            reader.close()
+            writer.close()
+
+    def test_other_wait_oserror_remains_fatal(self):
+        handle = main.WorkerHandle(mock.Mock(), mock.Mock(closed=False), mock.Mock())
+        with mock.patch.object(
+            main, "wait", side_effect=OSError(errno.EIO, "I/O failure")
+        ):
+            with self.assertRaises(OSError):
+                main.receive_worker_messages([handle], main.SearchState(), "a", "", 0)

@@ -1132,7 +1132,13 @@ def receive_worker_messages(
     }
     if not readers:
         return
-    for connection in wait(list(readers), timeout=timeout):
+    try:
+        ready = wait(list(readers), timeout=timeout)
+    except InterruptedError:
+        # Windows Ctrl+C can interrupt this wait with EINTR. The caller's
+        # signal checkpoint handles a pending request; otherwise retry normally.
+        return
+    for connection in ready:
         worker_id = readers[connection]
         try:
             message = json.loads(connection.recv_bytes(MAX_WORKER_MESSAGE_BYTES))
