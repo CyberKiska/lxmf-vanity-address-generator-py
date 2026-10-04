@@ -115,6 +115,29 @@ class WorkerHandle:
     cancel: Connection
 
 
+def silence_dead_stream(stream: object) -> None:
+    """Redirect a failed stream so exit-time flushing cannot change the outcome."""
+    try:
+        target_fd = stream.fileno()  # type: ignore[attr-defined]
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            if devnull != target_fd:
+                os.dup2(devnull, target_fd)
+        finally:
+            if devnull != target_fd:
+                os.close(devnull)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def print_diagnostic(message: str) -> None:
+    """Best-effort stderr output; a dead reader must not change control flow."""
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        silence_dead_stream(sys.stderr)
+
+
 def lxmf_hash_hex_for_identity(identity: RNS.Identity) -> str:
     """Return the final lowercase 32-character lxmf.delivery hash."""
     return RNS.Destination.hash(identity, LXMF_APP_NAME, *LXMF_ASPECTS).hex()
@@ -796,10 +819,9 @@ def prepare_output_staging(path: str) -> OutputStaging:
         probe_path = None
 
         if not _fsync_directory(parent):
-            print(
+            print_diagnostic(
                 "WARNING: directory metadata flushing is unavailable; file "
-                "contents will be flushed, but crash durability is limited.",
-                file=sys.stderr,
+                "contents will be flushed, but crash durability is limited."
             )
         if staging_path is None or staging_inode is None:
             raise ValueError("output staging was not initialized")
@@ -844,9 +866,8 @@ def secure_write_identity(path: str, private_key_bytes: bytes) -> str:
         )
         extra_private_path = staging.finalize()
         if extra_private_path is not None:
-            print(
-                f"WARNING: additional private-key link remains at {extra_private_path!r}.",
-                file=sys.stderr,
+            print_diagnostic(
+                f"WARNING: additional private-key link remains at {extra_private_path!r}."
             )
         return saved_path
     except Exception as exc:
@@ -1091,11 +1112,9 @@ def print_status(total_tries: int, started_at: float, nominal_attempts: int) -> 
     estimate = "unknown"
     if rate > 0:
         estimate = format_duration(nominal_attempts / rate)
-    print(
+    print_diagnostic(
         f"[status] tries={total_tries:,} elapsed={elapsed:.1f}s "
-        f"rate={rate:,.0f}/s nominal_time_at_rate={estimate}",
-        file=sys.stderr,
-        flush=True,
+        f"rate={rate:,.0f}/s nominal_time_at_rate={estimate}"
     )
 
 
@@ -1161,7 +1180,7 @@ def wait_for_search_trigger(
             return
         receive_worker_messages(workers, state, prefix_hex, postfix_hex, 0.25)
         if not reported_ready and len(state.ready_workers) == len(workers):
-            print(f"[ready] workers={len(workers)}", file=sys.stderr, flush=True)
+            print_diagnostic(f"[ready] workers={len(workers)}")
             reported_ready = True
         now = time.perf_counter()
         if now - last_status >= STATUS_INTERVAL:
@@ -1318,15 +1337,14 @@ def _print_interruption_summary(
     started_at: float | None,
 ) -> None:
     if started_at is None:
-        print(f"{label} before the search started.", file=sys.stderr)
+        print_diagnostic(f"{label} before the search started.")
         return
     elapsed = time.perf_counter() - started_at
     rate = state.total_tries / elapsed if elapsed > 0 else 0.0
     suffix = "" if state.attempt_count_exact else " (reported)"
-    print(
+    print_diagnostic(
         f"{label} after {state.total_tries:,} attempts{suffix} in "
-        f"{elapsed:.2f}s ({rate:,.0f}/s).",
-        file=sys.stderr,
+        f"{elapsed:.2f}s ({rate:,.0f}/s)."
     )
 
 
@@ -1371,37 +1389,30 @@ def run_generation(
         try:
             staging = prepare_output_staging(args.out)
         except ValueError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
+            print_diagnostic(f"ERROR: {exc}")
             return 2
         signal_state.raise_if_requested()
 
         required_positions = constrained_positions(prefix_hex, postfix_hex)
         difficulty_bits = 4 * required_positions
-        print(
+        print_diagnostic(
             f"Searching lxmf.delivery for prefix={prefix_hex or '-'} "
-            f"postfix={postfix_hex or '-'} with {workers} worker process(es).",
-            file=sys.stderr,
+            f"postfix={postfix_hex or '-'} with {workers} worker process(es)."
         )
-        print(
-            f"RNS {rns_version()}; {crypto_description}.",
-            file=sys.stderr,
-        )
+        print_diagnostic(f"RNS {rns_version()}; {crypto_description}.")
         if required_positions == DEST_HASH_HEX_LEN:
-            print(
+            print_diagnostic(
                 f"Nominal per-attempt odds: 1 in {nominal_attempts:,} "
-                f"({difficulty_bits} constrained bits).",
-                file=sys.stderr,
+                f"({difficulty_bits} constrained bits)."
             )
-            print(
+            print_diagnostic(
                 "WARNING: an arbitrary exact 32-character target may have no "
-                "RNS identity-hash preimage and is computationally infeasible.",
-                file=sys.stderr,
+                "RNS identity-hash preimage and is computationally infeasible."
             )
         else:
-            print(
+            print_diagnostic(
                 f"Expected average attempts: {nominal_attempts:,} "
-                f"({difficulty_bits} constrained bits).",
-                file=sys.stderr,
+                f"({difficulty_bits} constrained bits)."
             )
 
         started_at = time.perf_counter()
@@ -1437,7 +1448,7 @@ def run_generation(
                 if state.errors
                 else "all workers exited without a match"
             )
-            print(f"ERROR: {error}", file=sys.stderr)
+            print_diagnostic(f"ERROR: {error}")
             return 1
 
         saved_path = staging.write_and_publish(
@@ -1446,32 +1457,37 @@ def run_generation(
 
         extra_private_path = staging.finalize()
         for error in state.errors:
-            print(f"WARNING: {error}", file=sys.stderr)
+            print_diagnostic(f"WARNING: {error}")
         if extra_private_path is not None:
-            print(
+            print_diagnostic(
                 "WARNING: final output is valid, but an additional private-key "
-                f"link remains at {extra_private_path!r}; remove it securely.",
-                file=sys.stderr,
+                f"link remains at {extra_private_path!r}; remove it securely."
             )
 
-        elapsed = time.perf_counter() - started_at
-        print_success(
-            prefix_hex=prefix_hex,
-            postfix_hex=postfix_hex,
-            address_hex=state.match_addr_hex,
-            private_key=state.match_private_key,
-            saved_path=saved_path,
-            total_tries=state.total_tries,
-            count_exact=state.attempt_count_exact,
-            elapsed=elapsed,
-            show_private_import_strings=args.show_private_import_strings,
-        )
+        try:
+            print_success(
+                prefix_hex=prefix_hex,
+                postfix_hex=postfix_hex,
+                address_hex=state.match_addr_hex,
+                private_key=state.match_private_key,
+                saved_path=saved_path,
+                total_tries=state.total_tries,
+                count_exact=state.attempt_count_exact,
+                elapsed=time.perf_counter() - started_at,
+                show_private_import_strings=args.show_private_import_strings,
+            )
+            sys.stdout.flush()
+        except (OSError, ValueError) as report_exc:
+            silence_dead_stream(sys.stdout)
+            print_diagnostic(
+                f"WARNING: identity saved at {saved_path!r}, but the result "
+                f"could not be written to stdout: {report_exc}"
+            )
         if signal_state.signum is not None:
-            print(
+            print_diagnostic(
                 "WARNING: a termination signal arrived while the verified "
                 "private output was being committed; publication completed "
-                "safely and this invocation is reporting success.",
-                file=sys.stderr,
+                "safely and this invocation is reporting success."
             )
         return 0
 
@@ -1479,84 +1495,71 @@ def run_generation(
         try:
             preserve_match()
         except Exception as preserve_exc:
-            print(
-                f"WARNING: match preservation failed: {preserve_exc}", file=sys.stderr
-            )
+            print_diagnostic(f"WARNING: match preservation failed: {preserve_exc}")
         try:
             stop_workers(report_missing=False)
         except Exception as shutdown_exc:
-            print(f"WARNING: worker shutdown failed: {shutdown_exc}", file=sys.stderr)
+            print_diagnostic(f"WARNING: worker shutdown failed: {shutdown_exc}")
         _print_interruption_summary("Interrupted", state, started_at)
         return 130
     except TerminationRequested:
         try:
             preserve_match()
         except Exception as preserve_exc:
-            print(
-                f"WARNING: match preservation failed: {preserve_exc}", file=sys.stderr
-            )
+            print_diagnostic(f"WARNING: match preservation failed: {preserve_exc}")
         try:
             stop_workers(report_missing=False)
         except Exception as shutdown_exc:
-            print(f"WARNING: worker shutdown failed: {shutdown_exc}", file=sys.stderr)
+            print_diagnostic(f"WARNING: worker shutdown failed: {shutdown_exc}")
         _print_interruption_summary("Terminated", state, started_at)
         return 143
     except Exception as exc:
         try:
             preserve_match()
         except Exception as preserve_exc:
-            print(
-                f"WARNING: match preservation failed: {preserve_exc}", file=sys.stderr
-            )
+            print_diagnostic(f"WARNING: match preservation failed: {preserve_exc}")
         try:
             stop_workers(report_missing=False)
         except Exception as shutdown_exc:
-            print(f"WARNING: worker shutdown failed: {shutdown_exc}", file=sys.stderr)
-        print(f"ERROR: {exc}", file=sys.stderr)
+            print_diagnostic(f"WARNING: worker shutdown failed: {shutdown_exc}")
+        print_diagnostic(f"ERROR: {exc}")
         return 1
     finally:
         if not workers_collected:
             try:
                 stop_workers(report_missing=False)
             except Exception as shutdown_exc:
-                print(
-                    f"WARNING: final worker cleanup failed: {shutdown_exc}",
-                    file=sys.stderr,
+                print_diagnostic(
+                    f"WARNING: final worker cleanup failed: {shutdown_exc}"
                 )
         try:
             # Shutdown can deliver a late winner on an interrupt or error path.
             preserve_match()
         except Exception as preserve_exc:
-            print(
-                f"WARNING: could not preserve a late match: {preserve_exc}",
-                file=sys.stderr,
+            print_diagnostic(
+                f"WARNING: could not preserve a late match: {preserve_exc}"
             )
         for handle in started_workers:
             for connection in (handle.cancel, handle.messages):
                 try:
                     connection.close()
                 except (OSError, ValueError) as close_exc:
-                    print(
-                        f"WARNING: worker pipe cleanup failed: {close_exc}",
-                        file=sys.stderr,
+                    print_diagnostic(
+                        f"WARNING: worker pipe cleanup failed: {close_exc}"
                     )
             try:
                 if not handle.process.is_alive():
                     handle.process.close()
             except (OSError, ValueError) as close_exc:
-                print(
-                    f"WARNING: worker process cleanup failed: {close_exc}",
-                    file=sys.stderr,
-                )
+                print_diagnostic(f"WARNING: worker process cleanup failed: {close_exc}")
         if staging is not None:
             try:
                 recovery_path = staging.cleanup()
             except (OSError, ValueError) as cleanup_exc:
-                print(
+                print_diagnostic(
                     f"WARNING: staging cleanup failed: {cleanup_exc}; "
                     f"staging path was {staging.staging_path!r}, "
-                    f"final path was {staging.final_path!r}.",
-                    file=sys.stderr,
+                    f"final path was {staging.final_path!r}."
                 )
                 recovery_path = (
                     (staging.staging_path or None)
@@ -1564,16 +1567,21 @@ def run_generation(
                     else None
                 )
             if recovery_path is not None:
-                print(
+                print_diagnostic(
                     "RECOVERY: possible private-key staging at "
-                    f"{recovery_path!r}; verify it before use and do not share it.",
-                    file=sys.stderr,
+                    f"{recovery_path!r}; verify it before use and do not share it."
                 )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        reconfigure = getattr(sys.stdout, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(errors="backslashreplace")
+    except (OSError, ValueError):
+        silence_dead_stream(sys.stdout)
     signal_state = SignalState()
     previous_signal_handlers: dict[int, object] = {}
 
@@ -1598,12 +1606,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         required_positions = constrained_positions(prefix_hex, postfix_hex)
         nominal_attempts = expected_attempts(prefix_hex, postfix_hex)
         if required_positions > MAX_UNFORCED_CONSTRAINED_HEX and not args.force:
-            print(
+            print_diagnostic(
                 "ERROR: this search constrains "
                 f"{required_positions} hex characters and has a nominal mean of "
                 f"{nominal_attempts:,} attempts under a uniform-hash model. "
-                "Re-run with --force if this is intentional.",
-                file=sys.stderr,
+                "Re-run with --force if this is intentional."
             )
             return 2
 
@@ -1620,13 +1627,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             signal_state,
         )
     except ValueError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print_diagnostic(f"ERROR: {exc}")
         return 2
     except KeyboardInterrupt:
-        print("Interrupted before generation could start.", file=sys.stderr)
+        print_diagnostic("Interrupted before generation could start.")
         return 130
     except TerminationRequested:
-        print("Terminated before generation could start.", file=sys.stderr)
+        print_diagnostic("Terminated before generation could start.")
         return 143
     finally:
         for termination_signal, previous_handler in previous_signal_handlers.items():

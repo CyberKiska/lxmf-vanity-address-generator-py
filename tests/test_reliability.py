@@ -4,12 +4,24 @@ import io
 import os
 from pathlib import Path
 import signal
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 import RNS
 import main
+
+
+class _DeadStream(io.TextIOBase):
+    """A text stream whose reader has gone away."""
+
+    def writable(self):
+        return True
+
+    def write(self, _text):
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
 
 
 class MatchPreservationTests(unittest.TestCase):
@@ -283,3 +295,113 @@ class MatchPreservationTests(unittest.TestCase):
                 "recovery key differs from the verified winner",
             )
             self.assertFalse(os.path.lexists(os.path.join(directory, "identity")))
+
+    # T1.2
+    def test_dead_status_stream_does_not_stop_the_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, stdout, _ = self.run_main(directory, stderr=_DeadStream())
+            self.assertEqual(result, 0)
+            self.assertIn("Identity Found", stdout.getvalue())
+            self.assert_saved(directory)
+
+    # T1.2
+    def test_dead_result_stream_after_publication_is_still_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, _, stderr = self.run_main(directory, stdout=_DeadStream())
+            self.assertEqual(result, 0, stderr.getvalue())
+            self.assertIn("could not be written to stdout", stderr.getvalue())
+            self.assert_saved(directory)
+
+
+class StreamReliabilityTests(unittest.TestCase):
+    def test_real_closed_pipes_do_not_change_saved_success(self):
+        for closed_name in ("stderr", "stdout"):
+            with (
+                self.subTest(stream=closed_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = directory + "/identity"
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        main.__file__,
+                        "--prefix=a",
+                        "--workers=1",
+                        "--out=" + path,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                try:
+                    closed = getattr(process, closed_name)
+                    closed.close()
+                    setattr(process, closed_name, None)
+                    stdout, stderr = process.communicate(timeout=30)
+                    self.assertEqual(process.returncode, 0, stderr)
+                    identity = RNS.Identity.from_file(path)
+                    self.assertIsNotNone(identity)
+                    self.assertTrue(
+                        main.lxmf_hash_hex_for_identity(identity).startswith("a")
+                    )
+                    self.assertEqual(os.listdir(directory), ["identity"])
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate(timeout=5)
+
+    def test_ascii_stdout_escapes_unicode_output_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = directory + "/ключ.identity"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    main.__file__,
+                    "--prefix=a",
+                    "--workers=1",
+                    "--out=" + path,
+                ],
+                env={**os.environ, "PYTHONIOENCODING": "ascii"},
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b"\\u043a", result.stdout)
+            self.assertIsNotNone(RNS.Identity.from_file(path))
+
+    def test_closed_text_wrapper_does_not_abort_generation(self):
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+        stream.close()
+        with tempfile.TemporaryDirectory() as directory:
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stderr):
+                result = main.main(
+                    ["--prefix=a", "--workers=1", "--out=" + directory + "/identity"]
+                )
+            self.assertEqual(result, 0, stderr.getvalue())
+            self.assertIsNotNone(RNS.Identity.from_file(directory + "/identity"))
+
+    def test_devnull_descriptor_reuse_does_not_close_repaired_descriptor(self):
+        stream = mock.Mock()
+        stream.fileno.return_value = 42
+        with (
+            mock.patch.object(os, "open", return_value=42),
+            mock.patch.object(os, "dup2") as dup,
+            mock.patch.object(os, "close") as close,
+        ):
+            main.silence_dead_stream(stream)
+        dup.assert_not_called()
+        close.assert_not_called()
+
+    def test_silencing_unusable_fileno_is_best_effort(self):
+        for stream in (object(), io.StringIO()):
+            main.silence_dead_stream(stream)
+
+    def test_diagnostic_encoding_failure_is_best_effort(self):
+        with contextlib.redirect_stderr(_DeadStream()):
+            main.print_diagnostic("status")
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+        try:
+            with contextlib.redirect_stderr(stream):
+                main.print_diagnostic("ключ")
+        finally:
+            stream.close()
