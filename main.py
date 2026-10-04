@@ -597,7 +597,8 @@ class OutputStaging:
 
     def write_and_publish(self, private_key: bytes, expected_address: str) -> str:
         """Share the exact key/address verification used by the CLI and helper."""
-        self.write_private_key(private_key)
+        if not self.private_key_verified:
+            self.write_private_key(private_key)
         saved_path = self.publish()
         try:
             reloaded = RNS.Identity.from_file(saved_path)
@@ -1358,6 +1359,14 @@ def run_generation(
         )
         workers_collected = True
 
+    def preserve_match() -> None:
+        if (
+            staging is not None
+            and state.match_private_key is not None
+            and not staging.may_contain_private_key
+        ):
+            staging.write_private_key(state.match_private_key)
+
     try:
         try:
             staging = prepare_output_staging(args.out)
@@ -1412,8 +1421,15 @@ def run_generation(
             nominal_attempts,
             signal_state,
         )
-        stop_workers(report_missing=True)
-        signal_state.raise_if_requested()
+        preserve_match()
+        try:
+            stop_workers(report_missing=True)
+        except RuntimeError as exc:
+            if state.match_private_key is None:
+                raise
+            state.errors.append(str(exc))
+        if state.match_private_key is None:
+            signal_state.raise_if_requested()
 
         if state.match_private_key is None or state.match_addr_hex is None:
             error = (
@@ -1424,26 +1440,13 @@ def run_generation(
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
 
-        # Preserve a verified winner even if another worker failed. All workers
-        # have stopped before any private output is published.
-        for error in state.errors:
-            print(f"WARNING: {error}", file=sys.stderr)
-
-        identity = RNS.Identity.from_bytes(state.match_private_key)
-        if identity is None:
-            raise RuntimeError("could not reconstruct the winning identity")
-
-        derived_addr_hex = lxmf_hash_hex_for_identity(identity)
-        if derived_addr_hex != state.match_addr_hex or not matches_vanity(
-            derived_addr_hex, prefix_hex, postfix_hex
-        ):
-            raise RuntimeError("final LXMF result validation failed")
-
         saved_path = staging.write_and_publish(
             state.match_private_key, state.match_addr_hex
         )
 
         extra_private_path = staging.finalize()
+        for error in state.errors:
+            print(f"WARNING: {error}", file=sys.stderr)
         if extra_private_path is not None:
             print(
                 "WARNING: final output is valid, but an additional private-key "
@@ -1474,6 +1477,12 @@ def run_generation(
 
     except KeyboardInterrupt:
         try:
+            preserve_match()
+        except Exception as preserve_exc:
+            print(
+                f"WARNING: match preservation failed: {preserve_exc}", file=sys.stderr
+            )
+        try:
             stop_workers(report_missing=False)
         except Exception as shutdown_exc:
             print(f"WARNING: worker shutdown failed: {shutdown_exc}", file=sys.stderr)
@@ -1481,12 +1490,24 @@ def run_generation(
         return 130
     except TerminationRequested:
         try:
+            preserve_match()
+        except Exception as preserve_exc:
+            print(
+                f"WARNING: match preservation failed: {preserve_exc}", file=sys.stderr
+            )
+        try:
             stop_workers(report_missing=False)
         except Exception as shutdown_exc:
             print(f"WARNING: worker shutdown failed: {shutdown_exc}", file=sys.stderr)
         _print_interruption_summary("Terminated", state, started_at)
         return 143
     except Exception as exc:
+        try:
+            preserve_match()
+        except Exception as preserve_exc:
+            print(
+                f"WARNING: match preservation failed: {preserve_exc}", file=sys.stderr
+            )
         try:
             stop_workers(report_missing=False)
         except Exception as shutdown_exc:
@@ -1502,17 +1523,50 @@ def run_generation(
                     f"WARNING: final worker cleanup failed: {shutdown_exc}",
                     file=sys.stderr,
                 )
+        try:
+            # Shutdown can deliver a late winner on an interrupt or error path.
+            preserve_match()
+        except Exception as preserve_exc:
+            print(
+                f"WARNING: could not preserve a late match: {preserve_exc}",
+                file=sys.stderr,
+            )
         for handle in started_workers:
-            handle.cancel.close()
-            handle.messages.close()
-            if not handle.process.is_alive():
-                handle.process.close()
+            for connection in (handle.cancel, handle.messages):
+                try:
+                    connection.close()
+                except (OSError, ValueError) as close_exc:
+                    print(
+                        f"WARNING: worker pipe cleanup failed: {close_exc}",
+                        file=sys.stderr,
+                    )
+            try:
+                if not handle.process.is_alive():
+                    handle.process.close()
+            except (OSError, ValueError) as close_exc:
+                print(
+                    f"WARNING: worker process cleanup failed: {close_exc}",
+                    file=sys.stderr,
+                )
         if staging is not None:
-            recovery_path = staging.cleanup()
+            try:
+                recovery_path = staging.cleanup()
+            except (OSError, ValueError) as cleanup_exc:
+                print(
+                    f"WARNING: staging cleanup failed: {cleanup_exc}; "
+                    f"staging path was {staging.staging_path!r}, "
+                    f"final path was {staging.final_path!r}.",
+                    file=sys.stderr,
+                )
+                recovery_path = (
+                    (staging.staging_path or None)
+                    if staging.may_contain_private_key
+                    else None
+                )
             if recovery_path is not None:
                 print(
-                    "RECOVERY: private-key staging was preserved at "
-                    f"{recovery_path!r}. It is mode 0600; do not share it.",
+                    "RECOVERY: possible private-key staging at "
+                    f"{recovery_path!r}; verify it before use and do not share it.",
                     file=sys.stderr,
                 )
 
