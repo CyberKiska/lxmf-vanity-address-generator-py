@@ -47,6 +47,7 @@ COMPAT_LXMF_HASH = "9791e5d689822dd883308f3ca9d69aee"
 HEX_ALPHABET = frozenset("0123456789abcdef")
 PROGRESS_BATCH_SIZE = 1024
 CANCEL_CHECK_INTERVAL = 64
+HANDLED_SIGNALS = ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK")
 # A frame plus Connection's four-byte header fits POSIX's minimum PIPE_BUF.
 # A killed writer therefore cannot leave a partial message blocking the reader.
 MAX_WORKER_MESSAGE_BYTES = 508
@@ -72,7 +73,11 @@ MSG_DONE = "done"
 
 
 class TerminationRequested(BaseException):
-    """Raised in the parent process when SIGTERM requests clean shutdown."""
+    """Raised in the parent process when a signal requests clean shutdown."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
 
 
 class OutputWriteError(RuntimeError):
@@ -90,11 +95,8 @@ class SignalState:
             self.signum = signum
 
     def raise_if_requested(self) -> None:
-        if self.signum is None:
-            return
-        if self.signum == getattr(signal, "SIGINT", None):
-            raise KeyboardInterrupt
-        raise TerminationRequested
+        if self.signum is not None:
+            raise TerminationRequested(self.signum)
 
 
 @dataclass
@@ -918,7 +920,7 @@ def worker(
     cancel: Connection,
     messages: Connection,
 ) -> None:
-    for signal_name in ("SIGINT", "SIGTERM"):
+    for signal_name in HANDLED_SIGNALS:
         child_signal = getattr(signal, signal_name, None)
         if child_signal is not None:
             try:
@@ -1497,7 +1499,8 @@ def run_generation(
             )
         return 0
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, TerminationRequested) as exc:
+        signum = getattr(exc, "signum", signal.SIGINT)
         try:
             preserve_match()
         except Exception as preserve_exc:
@@ -1506,19 +1509,12 @@ def run_generation(
             stop_workers(report_missing=False)
         except Exception as shutdown_exc:
             print_diagnostic(f"WARNING: worker shutdown failed: {shutdown_exc}")
-        _print_interruption_summary("Interrupted", state, started_at)
-        return 130
-    except TerminationRequested:
-        try:
-            preserve_match()
-        except Exception as preserve_exc:
-            print_diagnostic(f"WARNING: match preservation failed: {preserve_exc}")
-        try:
-            stop_workers(report_missing=False)
-        except Exception as shutdown_exc:
-            print_diagnostic(f"WARNING: worker shutdown failed: {shutdown_exc}")
-        _print_interruption_summary("Terminated", state, started_at)
-        return 143
+        _print_interruption_summary(
+            "Interrupted" if signum == signal.SIGINT else "Terminated",
+            state,
+            started_at,
+        )
+        return 128 + signum
     except Exception as exc:
         try:
             preserve_match()
@@ -1592,7 +1588,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     previous_signal_handlers: dict[int, object] = {}
 
     try:
-        for signal_name in ("SIGINT", "SIGTERM"):
+        for signal_name in HANDLED_SIGNALS:
             termination_signal = getattr(signal, signal_name, None)
             if termination_signal is None:
                 continue
@@ -1635,12 +1631,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print_diagnostic(f"ERROR: {exc}")
         return 2
-    except KeyboardInterrupt:
-        print_diagnostic("Interrupted before generation could start.")
-        return 130
-    except TerminationRequested:
-        print_diagnostic("Terminated before generation could start.")
-        return 143
+    except (KeyboardInterrupt, TerminationRequested) as exc:
+        signum = getattr(exc, "signum", signal.SIGINT)
+        label = "Interrupted" if signum == signal.SIGINT else "Terminated"
+        print_diagnostic(f"{label} before generation could start.")
+        return 128 + signum
     finally:
         for termination_signal, previous_handler in previous_signal_handlers.items():
             try:

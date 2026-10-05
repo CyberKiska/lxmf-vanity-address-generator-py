@@ -925,6 +925,7 @@ class SignalIntegrationTests(unittest.TestCase):
                     stdout=subprocess.PIPE,
                     stderr=log,
                     text=True,
+                    start_new_session=True,
                 )
                 try:
                     deadline = time.monotonic() + 10
@@ -936,7 +937,7 @@ class SignalIntegrationTests(unittest.TestCase):
                         time.sleep(0.02)
                     self.assertIsNone(process.poll(), stderr)
                     self.assertIn("[ready] workers=2", stderr)
-                    process.send_signal(requested_signal)
+                    os.killpg(process.pid, requested_signal)
                     stdout, _ = process.communicate(timeout=15)
                 finally:
                     if process.poll() is None:
@@ -958,6 +959,9 @@ class SignalIntegrationTests(unittest.TestCase):
 
     def test_sigint_is_coordinated_and_returns_130(self):
         self.run_until_signal(signal.SIGINT, 130)
+
+    def test_sighup_is_coordinated_and_returns_129(self):
+        self.run_until_signal(signal.SIGHUP, 129)
 
     def test_sigterm_is_coordinated_and_returns_143(self):
         self.run_until_signal(signal.SIGTERM, 143)

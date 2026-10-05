@@ -467,3 +467,57 @@ class InterruptedWaitTests(unittest.TestCase):
         ):
             with self.assertRaises(OSError):
                 main.receive_worker_messages([handle], main.SearchState(), "a", "", 0)
+
+
+class SignalHandlingTests(unittest.TestCase):
+    def test_first_signal_wins_and_checkpoint_carries_its_number(self):
+        state = main.SignalState()
+        state.request(signal.SIGTERM, None)
+        state.request(signal.SIGINT, None)
+        self.assertEqual(state.signum, signal.SIGTERM)
+        with self.assertRaises(main.TerminationRequested) as raised:
+            state.raise_if_requested()
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+
+    def test_handlers_are_restored_after_validation_failure(self):
+        signals = [
+            getattr(signal, name)
+            for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK")
+            if hasattr(signal, name)
+        ]
+        before = {signum: signal.getsignal(signum) for signum in signals}
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main.main(["--prefix=not-hex", "--out=identity"]), 2)
+        self.assertEqual(
+            {signum: signal.getsignal(signum) for signum in signals}, before
+        )
+
+    def test_signal_before_generation_uses_128_plus_signal(self):
+        for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+            if not hasattr(signal, name):
+                continue
+            signum = getattr(signal, name)
+
+            def request_signal():
+                signal.raise_signal(signum)
+                return "test backend"
+
+            with (
+                self.subTest(signal=name),
+                mock.patch.object(
+                    main, "validate_runtime_environment", side_effect=request_signal
+                ),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(
+                    main.main(["--prefix=a", "--out=identity"]), 128 + signum
+                )
+
+    def test_workers_ignore_every_handled_signal(self):
+        cancel, messages = mock.Mock(), mock.Mock()
+        cancel.poll.return_value = True
+        with mock.patch.object(signal, "signal") as install:
+            main.worker(0, "a", "", cancel, messages)
+        for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+            if hasattr(signal, name):
+                install.assert_any_call(getattr(signal, name), signal.SIG_IGN)
