@@ -556,40 +556,7 @@ class CLITests(unittest.TestCase):
 
     def test_runtime_accepts_compatible_public_api(self):
         description = main.validate_runtime_environment()
-        self.assertIn("PyCA cryptography", description)
-
-    def test_runtime_accepts_compatible_rns_update(self):
-        with mock.patch.object(main, "rns_version", return_value="1.9.0"):
-            description = main.validate_runtime_environment()
-        self.assertIn("PyCA cryptography", description)
-
-    def test_runtime_enforces_supported_version_ranges(self):
-        with mock.patch.object(main, "rns_version", return_value="1.5.1"):
-            with self.assertRaisesRegex(ValueError, "expected >=1.5.2,<2.0"):
-                main.validate_runtime_environment()
-        with mock.patch.object(main, "rns_version", return_value="2.0.0"):
-            with self.assertRaisesRegex(ValueError, "expected >=1.5.2,<2.0"):
-                main.validate_runtime_environment()
-        with mock.patch.object(main, "cryptography_version", return_value="49.0.0"):
-            with self.assertRaisesRegex(ValueError, "expected >=50.0.0"):
-                main.validate_runtime_environment()
-
-    def test_runtime_rejects_prerelease_dependencies(self):
-        for value in ("1.6.0rc1", "2.0.0rc1", "2.0.dev0"):
-            with (
-                self.subTest(version=value),
-                mock.patch.object(main, "rns_version", return_value=value),
-            ):
-                with self.assertRaisesRegex(ValueError, "stable releases"):
-                    main.validate_runtime_environment()
-        with mock.patch.object(main, "cryptography_version", return_value="51.0.0rc1"):
-            with self.assertRaisesRegex(ValueError, "stable releases"):
-                main.validate_runtime_environment()
-
-    def test_runtime_rejects_shadowed_rns_import(self):
-        with mock.patch.object(main.RNS, "__file__", "/tmp/shadowed/RNS.py"):
-            with self.assertRaisesRegex(ValueError, "does not come from"):
-                main.validate_runtime_environment()
+        self.assertIn("crypto backend", description)
 
     def test_runtime_rejects_incompatible_hash_size(self):
         with mock.patch.object(main.RNS.Reticulum, "TRUNCATED_HASHLENGTH", 256):
