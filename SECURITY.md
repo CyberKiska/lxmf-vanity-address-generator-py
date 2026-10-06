@@ -2,11 +2,22 @@
 
 ## Supported scope
 
-Security fixes are prepared for the current default branch and runtime versions
-allowed by `requirements.txt`, with RNS 1.5.2 as the minimum supported release.
-CI tests the latest allowed RNS release on Python 3.14 across Linux, macOS,
-and Windows. Older commits, modified builds, and dependency versions outside
-the declared ranges are outside the reviewed configuration.
+Security fixes are prepared for the current default branch. The supported
+configuration is the latest stable RNS release actually tested successfully by
+CI, with PyCA cryptography on CPython 3.14 under Linux, macOS and Windows.
+CI runs on pushes, pull requests and weekly; a newly released dependency is
+not verified until those jobs pass. RNS 1.5.2 is the chosen installation minimum,
+and cryptography 50.0.0 is the installation floor from the dated advisory review.
+Audit the actual resolved versions before deployment.
+
+Startup known answers check specific protocol properties, not security or full
+compatibility. Older and prerelease dependencies are not blocked at runtime,
+but passing those checks alone does not establish support. Historical
+compatibility experiments include RNS 1.4.2; that is not a supported-version
+promise. Modified builds and manually selected RNS internal crypto providers
+are outside the supported configuration. The internal provider has received
+less scrutiny than OpenSSL; matching test vectors does not give it equivalent
+security assurance.
 
 ## Reporting a vulnerability
 
