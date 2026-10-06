@@ -1,5 +1,9 @@
 import contextlib
 import io
+import os
+import subprocess
+import sys
+import tempfile
 import hashlib
 
 import RNS
@@ -71,3 +75,38 @@ class PrivateVectorTests(unittest.TestCase):
         with mock.patch.object(main, "COMPAT_PRIVATE_KEY_PUBLIC", bytes(64)):
             with self.assertRaisesRegex(ValueError, "RFC 7748/8032"):
                 main.validate_runtime_environment()
+
+
+class ReferenceInteropTests(unittest.TestCase):
+    def test_official_rnid_derives_the_same_address_from_the_saved_file(self):
+        identity = RNS.Identity(create_keys=True)
+        expected = main.lxmf_hash_hex_for_identity(identity)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "identity")
+            staging = main.prepare_output_staging(path)
+            try:
+                staging.write_and_publish(identity.get_private_key(), expected)
+                staging.finalize()
+            finally:
+                staging.cleanup()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "RNS.Utilities.rnid",
+                    "--config",
+                    os.path.join(directory, "unused-rns-config"),
+                    "-i",
+                    path,
+                    "-H",
+                    "lxmf.delivery",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            output = completed.stdout + completed.stderr
+            self.assertEqual(completed.returncode, 0, output)
+            self.assertIn(f"<{expected}>", completed.stdout)
+            # rnid must not have needed a Reticulum instance for this.
+            self.assertEqual(os.listdir(directory), ["identity"])
