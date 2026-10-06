@@ -35,6 +35,17 @@ COMPAT_PUBLIC_KEY = bytes.fromhex(
     "5bc1620e8c8960ab80304646f000bbfa9e0df46070384ed8a409c14c8e9c8de9"
 )
 COMPAT_LXMF_HASH = "9791e5d689822dd883308f3ca9d69aee"
+# Published test keys: RFC 7748 section 6.1 (Alice, X25519), followed by
+# RFC 8032 section 7.1 TEST 1 (Ed25519). Never use them as a real identity.
+COMPAT_PRIVATE_KEY = bytes.fromhex(
+    "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+)
+COMPAT_PRIVATE_KEY_PUBLIC = bytes.fromhex(
+    "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+)
+COMPAT_PRIVATE_KEY_LXMF_HASH = "91eb19b62a69a9913d50e49f6376e7a0"
 HEX_ALPHABET = frozenset("0123456789abcdef")
 PROGRESS_BATCH_SIZE = 1024
 CANCEL_CHECK_INTERVAL = 64
@@ -186,6 +197,15 @@ def validate_runtime_environment() -> str:
             != COMPAT_LXMF_HASH
         ):
             raise ValueError("lxmf.delivery destination derivation is incompatible")
+        # Pin the private-key halves and scalar interpretation to RFC outputs.
+        rfc_identity = RNS.Identity.from_bytes(COMPAT_PRIVATE_KEY)
+        if (
+            rfc_identity is None
+            or rfc_identity.get_public_key() != COMPAT_PRIVATE_KEY_PUBLIC
+            or lxmf_hash_hex_for_identity(rfc_identity) != COMPAT_PRIVATE_KEY_LXMF_HASH
+        ):
+            raise ValueError("RFC 7748/8032 private-key vector is not reproduced")
+
         identity = gen_identity()
         private_key = identity.get_private_key()
         if not isinstance(private_key, bytes) or len(private_key) != 64:
