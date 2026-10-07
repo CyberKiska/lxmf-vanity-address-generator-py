@@ -110,3 +110,40 @@ class ReferenceInteropTests(unittest.TestCase):
             self.assertIn(f"<{expected}>", completed.stdout)
             # rnid must not have needed a Reticulum instance for this.
             self.assertEqual(os.listdir(directory), ["identity"])
+
+
+class KeyGenerationTests(unittest.TestCase):
+    def test_runtime_rejects_repeated_identity_halves_and_malformed_second_key(self):
+        identity = RNS.Identity(create_keys=True)
+        other = RNS.Identity(create_keys=True)
+        key, other_key = identity.get_private_key(), other.get_private_key()
+        cases = (
+            ("whole identity", key, "repeated key material"),
+            ("X25519 half", key[:32] + other_key[32:], "repeated key material"),
+            ("Ed25519 half", other_key[:32] + key[32:], "repeated key material"),
+            ("cross half", other_key[:32] + key[:32], "repeated key material"),
+            ("short key", b"short", "64-byte key"),
+            ("non-bytes key", None, "64-byte key"),
+        )
+        for label, second_key, message in cases:
+            second = mock.Mock()
+            second.get_private_key.return_value = second_key
+            with (
+                self.subTest(case=label),
+                mock.patch.object(main, "gen_identity", side_effect=[identity, second]),
+            ):
+                with self.assertRaisesRegex(ValueError, message):
+                    main.validate_runtime_environment()
+
+    def test_workers_are_spawned_never_forked(self):
+        handle = main.start_worker(0, "0" * 32, "")
+        try:
+            self.assertEqual(type(handle.process).__name__, "SpawnProcess")
+        finally:
+            state = main.SearchState()
+            main.collect_worker_shutdown(
+                [handle], state, "0" * 32, "", report_missing=False
+            )
+            handle.cancel.close()
+            handle.messages.close()
+            handle.process.close()

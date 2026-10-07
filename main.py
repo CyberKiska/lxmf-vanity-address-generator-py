@@ -210,6 +210,13 @@ def validate_runtime_environment() -> str:
         private_key = identity.get_private_key()
         if not isinstance(private_key, bytes) or len(private_key) != 64:
             raise ValueError("generated identity did not contain a 64-byte key")
+        # Parent-only startup smoke check, not a continuous RNG health test.
+        other_key = gen_identity().get_private_key()
+        if not isinstance(other_key, bytes) or len(other_key) != 64:
+            raise ValueError("generated identity did not contain a 64-byte key")
+        halves = {private_key[:32], private_key[32:], other_key[:32], other_key[32:]}
+        if len(halves) != 4:
+            raise ValueError("RNS generated repeated key material")
         restored = RNS.Identity.from_bytes(private_key)
         if (
             restored is None
