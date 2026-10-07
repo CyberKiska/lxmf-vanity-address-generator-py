@@ -17,6 +17,11 @@ import time
 from typing import Sequence
 
 try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+try:
     import RNS
 except ImportError as exc:  # pragma: no cover - exercised without the dependency
     raise SystemExit(
@@ -350,6 +355,31 @@ def validate_output_path(path: str) -> str:
     return abs_path
 
 
+UNSUPPORTED_FULL_FLUSH_ERRNOS = frozenset(
+    {errno.EINVAL, errno.ENOTSUP, errno.ENOSYS, errno.ENOTTY}
+)
+
+
+def _flush_fd(fd: int) -> None:
+    """fsync, then request a full drive-cache flush on macOS."""
+    os.fsync(fd)
+    if sys.platform != "darwin":
+        return
+    full_fsync = getattr(fcntl, "F_FULLFSYNC", None)
+    if full_fsync is None:
+        print_diagnostic("WARNING: full drive flushing is unavailable; fsync only.")
+        return
+    try:
+        fcntl.fcntl(fd, full_fsync)
+    except OSError as exc:
+        if exc.errno not in UNSUPPORTED_FULL_FLUSH_ERRNOS:
+            raise
+        print_diagnostic(
+            "WARNING: full drive flushing is unsupported for this file or "
+            "filesystem; fsync completed but power-loss durability is limited."
+        )
+
+
 def _fsync_directory(path: str) -> bool:
     """Flush directory metadata, tolerating only known unsupported operations."""
     if os.name == "nt":
@@ -362,7 +392,7 @@ def _fsync_directory(path: str) -> bool:
     directory_fd = -1
     try:
         directory_fd = os.open(path, flags)
-        os.fsync(directory_fd)
+        _flush_fd(directory_fd)
         return True
     except OSError as exc:
         if exc.errno in {errno.EINVAL, errno.ENOTSUP, errno.ENOSYS}:
@@ -505,7 +535,7 @@ def _preflight_exclusive_copy(probe_path: str) -> None:
         probe_stat = os.fstat(probe_fd)
         probe_inode = probe_stat.st_dev, probe_stat.st_ino
         _write_all(probe_fd, OUTPUT_STAGING_MARKER)
-        os.fsync(probe_fd)
+        _flush_fd(probe_fd)
     except BaseException:
         if probe_fd >= 0 and probe_inode is None:
             try:
@@ -564,7 +594,7 @@ class OutputStaging:
             os.lseek(self.fd, 0, os.SEEK_SET)
             _write_all(self.fd, private_key)
             os.ftruncate(self.fd, len(private_key))
-            os.fsync(self.fd)
+            _flush_fd(self.fd)
         except OSError as exc:
             raise OutputWriteError(
                 f"Could not durably stage the identity: {exc}. A complete key "
@@ -652,7 +682,7 @@ class OutputStaging:
                 private_key = _read_exact(self.fd, RNS.Identity.KEYSIZE // 8)
                 _write_all(output_fd, private_key)
                 os.ftruncate(output_fd, len(private_key))
-                os.fsync(output_fd)
+                _flush_fd(output_fd)
                 self.final_inode = output_inode
                 self.final_published = True
             except BaseException as exc:
@@ -757,7 +787,7 @@ def prepare_output_staging(path: str) -> OutputStaging:
         staging_stat = os.fstat(fd)
         staging_inode = staging_stat.st_dev, staging_stat.st_ino
         _write_all(fd, OUTPUT_STAGING_MARKER)
-        os.fsync(fd)
+        _flush_fd(fd)
         probe_path = _new_output_probe_path(
             parent,
             _path_component_length(os.path.basename(final_path)),

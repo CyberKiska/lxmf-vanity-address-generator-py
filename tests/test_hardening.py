@@ -1,9 +1,11 @@
 import contextlib
 import io
+import errno
 import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 import hashlib
 
 import RNS
@@ -204,3 +206,131 @@ class CoreDumpTests(unittest.TestCase):
         with mock.patch.object(main, "disable_core_dumps") as disable:
             main.worker(0, "a", "", cancel, mock.Mock())
             disable.assert_called_once()
+
+
+class FullFlushTests(unittest.TestCase):
+    def test_full_flush_runs_after_fsync_on_macos_only(self):
+        events = []
+        fcntl = mock.Mock(F_FULLFSYNC=51)
+        fcntl.fcntl.side_effect = lambda *args: events.append("full flush")
+        for platform, expected in (
+            ("darwin", ["fsync", "full flush"]),
+            ("linux", ["fsync"]),
+            ("win32", ["fsync"]),
+        ):
+            events.clear()
+            with (
+                self.subTest(platform=platform),
+                mock.patch.object(main.sys, "platform", platform),
+                mock.patch.object(main, "fcntl", fcntl, create=True),
+                mock.patch.object(
+                    os, "fsync", side_effect=lambda fd: events.append("fsync")
+                ),
+            ):
+                main._flush_fd(42)
+            self.assertEqual(events, expected)
+
+    def test_absent_and_unsupported_full_flush_warn_after_fsync(self):
+        for error in (None, errno.EINVAL, errno.ENOTSUP, errno.ENOSYS, errno.ENOTTY):
+            fcntl = mock.Mock(F_FULLFSYNC=51) if error is not None else None
+            if fcntl is not None:
+                fcntl.fcntl.side_effect = OSError(error, "unsupported")
+            with (
+                self.subTest(errno=error),
+                mock.patch.object(main.sys, "platform", "darwin"),
+                mock.patch.object(main, "fcntl", fcntl, create=True),
+                mock.patch.object(os, "fsync") as fsync,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                main._flush_fd(42)
+            fsync.assert_called_once_with(42)
+            self.assertIn("WARNING:", stderr.getvalue())
+
+    def test_full_flush_io_errors_abort_preflight_without_leaving_files(self):
+        for error in (errno.EIO, errno.ENOSPC):
+            fcntl = mock.Mock(F_FULLFSYNC=51)
+            fcntl.fcntl.side_effect = OSError(error, "full flush I/O failure")
+            with (
+                self.subTest(errno=error),
+                tempfile.TemporaryDirectory() as directory,
+                mock.patch.object(main.sys, "platform", "darwin"),
+                mock.patch.object(main, "fcntl", fcntl, create=True),
+            ):
+                with self.assertRaisesRegex(ValueError, "full flush I/O failure"):
+                    main.prepare_output_staging(directory + "/identity")
+                self.assertEqual(os.listdir(directory), [])
+
+    def test_full_flush_failure_during_copy_publication_preserves_winner(self):
+        identity = RNS.Identity(create_keys=True)
+        key, address = (
+            identity.get_private_key(),
+            main.lxmf_hash_hex_for_identity(identity),
+        )
+        for error in (errno.EIO, errno.ENOSPC):
+            with self.subTest(errno=error), tempfile.TemporaryDirectory() as directory:
+                staging = main.prepare_output_staging(directory + "/identity")
+                try:
+                    staging.write_private_key(key)
+                    staging.publish_mode = main.PUBLISH_EXCLUSIVE_COPY
+                    fcntl = mock.Mock(F_FULLFSYNC=51)
+                    fcntl.fcntl.side_effect = OSError(error, "full flush I/O failure")
+                    with (
+                        mock.patch.object(main.sys, "platform", "darwin"),
+                        mock.patch.object(main, "fcntl", fcntl, create=True),
+                    ):
+                        with self.assertRaisesRegex(
+                            main.OutputWriteError, "full flush I/O failure"
+                        ):
+                            staging.write_and_publish(key, address)
+                    self.assertFalse(os.path.lexists(directory + "/identity"))
+                finally:
+                    recovery = staging.cleanup()
+                self.assertTrue(
+                    RNS.Identity.from_file(recovery).get_private_key() == key,
+                    "recovery key differs",
+                )
+
+    def test_ordinary_fsync_failure_prevents_full_flush(self):
+        fcntl = mock.Mock(F_FULLFSYNC=51)
+        with (
+            mock.patch.object(main.sys, "platform", "darwin"),
+            mock.patch.object(main, "fcntl", fcntl, create=True),
+            mock.patch.object(
+                os, "fsync", side_effect=OSError(errno.EIO, "I/O failure")
+            ),
+        ):
+            with self.assertRaises(OSError):
+                main._flush_fd(42)
+        fcntl.fcntl.assert_not_called()
+
+    def test_full_flush_failure_in_cli_keeps_recovery_without_success(self):
+        for error in (errno.EIO, errno.ENOSPC):
+            with self.subTest(errno=error), tempfile.TemporaryDirectory() as directory:
+                fcntl = mock.Mock(F_FULLFSYNC=51)
+
+                def fail_key_flush(fd, command):
+                    if os.fstat(fd).st_size == 64:
+                        raise OSError(error, "full flush I/O failure")
+
+                fcntl.fcntl.side_effect = fail_key_flush
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (
+                    mock.patch.object(main.sys, "platform", "darwin"),
+                    mock.patch.object(main, "fcntl", fcntl),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = main.main(
+                        [
+                            "--prefix=a",
+                            "--workers=1",
+                            "--out=" + directory + "/identity",
+                        ]
+                    )
+                self.assertEqual(result, 1)
+                self.assertNotIn("Identity Found", stdout.getvalue())
+                self.assertIn("RECOVERY:", stderr.getvalue())
+                self.assertFalse(os.path.lexists(directory + "/identity"))
+                recovery = list(Path(directory).glob("*.staging"))
+                self.assertEqual(len(recovery), 1)
+                self.assertIsNotNone(RNS.Identity.from_file(str(recovery[0])))
