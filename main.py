@@ -119,6 +119,17 @@ class WorkerHandle:
     cancel: Connection
 
 
+def disable_core_dumps() -> None:
+    """Best effort: suppress ordinary POSIX file core dumps."""
+    try:
+        import resource
+
+        _soft, hard = resource.getrlimit(resource.RLIMIT_CORE)
+        resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
+    except (ImportError, OSError, ValueError):
+        pass
+
+
 def silence_dead_stream(stream: object) -> None:
     """Redirect a failed stream so exit-time flushing cannot change the outcome."""
     try:
@@ -880,6 +891,7 @@ def worker(
             except (OSError, ValueError):
                 pass
 
+    disable_core_dumps()
     local_tries = 0
     reported_tries = 0
     try:
@@ -1532,6 +1544,7 @@ def run_generation(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    disable_core_dumps()
     try:
         reconfigure = getattr(sys.stdout, "reconfigure", None)
         if callable(reconfigure):

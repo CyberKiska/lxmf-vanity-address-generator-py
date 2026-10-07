@@ -147,3 +147,60 @@ class KeyGenerationTests(unittest.TestCase):
             handle.cancel.close()
             handle.messages.close()
             handle.process.close()
+
+
+class CoreDumpTests(unittest.TestCase):
+    def test_soft_core_limit_is_zeroed_without_lowering_hard_limit(self):
+        resource = mock.Mock(RLIMIT_CORE=4)
+        resource.getrlimit.return_value = (1024, 4096)
+        with mock.patch.dict(sys.modules, {"resource": resource}):
+            main.disable_core_dumps()
+        resource.setrlimit.assert_called_once_with(4, (0, 4096))
+
+    def test_unavailable_or_failed_resource_control_is_best_effort(self):
+        with mock.patch.dict(sys.modules, {"resource": None}):
+            main.disable_core_dumps()
+        for error in (OSError("unavailable"), ValueError("unsupported limit")):
+            resource = mock.Mock()
+            resource.getrlimit.side_effect = error
+            with mock.patch.dict(sys.modules, {"resource": resource}):
+                main.disable_core_dumps()
+            resource.getrlimit.side_effect = None
+            resource.getrlimit.return_value = (1, 10)
+            resource.setrlimit.side_effect = error
+            with mock.patch.dict(sys.modules, {"resource": resource}):
+                main.disable_core_dumps()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX resource limits required")
+    def test_effective_limit_in_disposable_subprocess(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import resource, main; before = resource.getrlimit(resource.RLIMIT_CORE); main.disable_core_dumps(); after = resource.getrlimit(resource.RLIMIT_CORE); assert after == (0, before[1])",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_parent_and_worker_suppress_cores_before_generating_keys(self):
+        with mock.patch.object(main, "disable_core_dumps") as disable:
+
+            def check_startup():
+                disable.assert_called_once()
+                raise ValueError("stop before generation")
+
+            with (
+                mock.patch.object(
+                    main, "validate_runtime_environment", side_effect=check_startup
+                ),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(main.main(["--prefix=a", "--out=identity"]), 2)
+        cancel = mock.Mock()
+        cancel.poll.return_value = True
+        with mock.patch.object(main, "disable_core_dumps") as disable:
+            main.worker(0, "a", "", cancel, mock.Mock())
+            disable.assert_called_once()
