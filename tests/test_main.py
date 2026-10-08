@@ -18,6 +18,26 @@ import RNS
 import main
 
 
+def write_identity(path, private_key):
+    """Use the same verified staging/publication path as the CLI."""
+    main._validate_private_key_bytes(private_key)
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise main.OutputWriteError("could not reconstruct the identity")
+    try:
+        staging = main.prepare_output_staging(path)
+    except ValueError as exc:
+        raise main.OutputWriteError(str(exc)) from exc
+    try:
+        saved = staging.write_and_publish(
+            private_key, main.lxmf_hash_hex_for_identity(identity)
+        )
+        staging.finalize()
+        return saved
+    finally:
+        staging.cleanup()
+
+
 class PatternValidationTests(unittest.TestCase):
     def test_uppercase_is_normalized(self):
         self.assertEqual(main.normalize_and_validate_patterns("AB", "Cd"), ("ab", "cd"))
@@ -123,7 +143,9 @@ class RNSCompatibilityTests(unittest.TestCase):
         validated = main.validate_match_payload(
             private_key, address, address[:2], address[-2:]
         )
-        self.assertEqual(validated, (private_key, address))
+        self.assertTrue(
+            validated == (private_key, address), "private-key output invariant failed"
+        )
 
         wrong_prefix = "0" if address[0] != "0" else "1"
         error = main.validate_match_payload(private_key, address, wrong_prefix, "")
@@ -156,7 +178,10 @@ class WorkerMessageTests(unittest.TestCase):
         main.record_worker_message((main.MSG_DONE, 0), state, "", "")
         main.record_worker_message((main.MSG_DONE, 1), state, "", "")
 
-        self.assertEqual(state.match_private_key, private_key)
+        self.assertTrue(
+            state.match_private_key == private_key,
+            "private-key output invariant failed",
+        )
         self.assertEqual(state.match_addr_hex, address)
         self.assertEqual(state.total_tries, 7)
         self.assertIn("synthetic failure", state.errors[0])
@@ -190,13 +215,16 @@ class SecureOutputTests(unittest.TestCase):
     def test_secure_write_is_mode_0600_and_rns_compatible(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "identity")
-            saved = main.secure_write_identity(path, self.private_key)
+            saved = write_identity(path, self.private_key)
 
             self.assertEqual(saved, path)
             if os.name == "posix":
                 self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
             with open(path, "rb") as handle:
-                self.assertEqual(handle.read(), self.private_key)
+                self.assertTrue(
+                    handle.read() == self.private_key,
+                    "private-key output invariant failed",
+                )
 
             reloaded = RNS.Identity.from_file(path)
             self.assertIsNotNone(reloaded)
@@ -209,16 +237,18 @@ class SecureOutputTests(unittest.TestCase):
     def test_secure_write_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "identity")
-            main.secure_write_identity(path, self.private_key)
+            write_identity(path, self.private_key)
             with open(path, "rb") as handle:
                 original = handle.read()
 
             other_key = RNS.Identity(create_keys=True).get_private_key()
             with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
-                main.secure_write_identity(path, other_key)
+                write_identity(path, other_key)
 
             with open(path, "rb") as handle:
-                self.assertEqual(handle.read(), original)
+                self.assertTrue(
+                    handle.read() == original, "private-key output invariant failed"
+                )
 
     @unittest.skipUnless(os.name == "posix", "POSIX symlink semantics required")
     def test_secure_write_refuses_a_dangling_symlink(self):
@@ -227,7 +257,7 @@ class SecureOutputTests(unittest.TestCase):
             target = os.path.join(directory, "missing")
             os.symlink(target, path)
             with self.assertRaisesRegex(main.OutputWriteError, "Refusing to overwrite"):
-                main.secure_write_identity(path, self.private_key)
+                write_identity(path, self.private_key)
             self.assertTrue(os.path.islink(path))
             self.assertFalse(os.path.exists(target))
 
@@ -258,8 +288,9 @@ class SecureOutputTests(unittest.TestCase):
                     staging.publish()
             recovery = staging.cleanup()
             self.assertIsNotNone(recovery)
-            self.assertEqual(
-                RNS.Identity.from_file(recovery).get_private_key(), self.private_key
+            self.assertTrue(
+                RNS.Identity.from_file(recovery).get_private_key() == self.private_key,
+                "private-key output invariant failed",
             )
 
     def test_finalize_flush_failure_reports_saved_identity(self):
@@ -273,8 +304,9 @@ class SecureOutputTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(main.OutputWriteError, "Identity is saved"):
                     staging.finalize()
-            self.assertEqual(
-                RNS.Identity.from_file(path).get_private_key(), self.private_key
+            self.assertTrue(
+                RNS.Identity.from_file(path).get_private_key() == self.private_key,
+                "private-key output invariant failed",
             )
             self.assertIsNone(staging.cleanup())
 
@@ -295,16 +327,17 @@ class SecureOutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "identity")
             with self.assertRaisesRegex(RuntimeError, "must be 64 bytes"):
-                main.secure_write_identity(path, b"short")
+                write_identity(path, b"short")
             self.assertFalse(os.path.exists(path))
 
     def test_long_valid_final_basename_uses_short_staging_name(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "x" * 242)
-            saved = main.secure_write_identity(path, self.private_key)
+            saved = write_identity(path, self.private_key)
             self.assertEqual(saved, path)
-            self.assertEqual(
-                RNS.Identity.from_file(saved).get_private_key(), self.private_key
+            self.assertTrue(
+                RNS.Identity.from_file(saved).get_private_key() == self.private_key,
+                "private-key output invariant failed",
             )
             self.assertEqual(os.listdir(directory), ["x" * 242])
 
@@ -333,9 +366,10 @@ class SecureOutputTests(unittest.TestCase):
             recovery_path = staging.cleanup()
             self.assertEqual(recovery_path, staging.staging_path)
             self.assertTrue(os.path.exists(recovery_path))
-            self.assertEqual(
-                RNS.Identity.from_file(recovery_path).get_private_key(),
-                self.private_key,
+            self.assertTrue(
+                RNS.Identity.from_file(recovery_path).get_private_key()
+                == self.private_key,
+                "private-key output invariant failed",
             )
             with open(path, "rb") as handle:
                 self.assertEqual(handle.read(), competitor)
@@ -354,8 +388,9 @@ class SecureOutputTests(unittest.TestCase):
             self.assertEqual(staging.publish(), path)
             self.assertIsNone(staging.finalize())
             self.assertIsNone(staging.cleanup())
-            self.assertEqual(
-                RNS.Identity.from_file(path).get_private_key(), self.private_key
+            self.assertTrue(
+                RNS.Identity.from_file(path).get_private_key() == self.private_key,
+                "private-key output invariant failed",
             )
 
     def test_preflight_never_places_marker_at_final_path(self):
@@ -426,7 +461,10 @@ class SecureOutputTests(unittest.TestCase):
             self.assertEqual(recovery_path, staging.staging_path)
             self.assertFalse(os.path.exists(path))
             with open(recovery_path, "rb") as handle:
-                self.assertEqual(handle.read(len(self.private_key)), self.private_key)
+                self.assertTrue(
+                    handle.read(len(self.private_key)) == self.private_key,
+                    "private-key output invariant failed",
+                )
 
     def test_interrupted_hard_link_publication_rolls_back_final_name(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -520,15 +558,32 @@ class OutputPrivacyTests(unittest.TestCase):
 
     def test_private_key_encodings_are_hidden_by_default(self):
         output = self.render(False)
-        self.assertNotIn(main.encode_base64(self.private_key), output)
-        self.assertNotIn(main.encode_base32(self.private_key), output)
-        self.assertNotIn("Generic private-key encodings", output)
+        self.assertTrue(
+            main.encode_base64(self.private_key) not in output,
+            "private-key output invariant failed",
+        )
+        self.assertTrue(
+            main.encode_base32(self.private_key) not in output,
+            "private-key output invariant failed",
+        )
+        self.assertTrue(
+            "Generic private-key encodings" not in output,
+            "private-key output invariant failed",
+        )
 
     def test_private_key_encodings_require_explicit_opt_in(self):
         output = self.render(True)
-        self.assertIn(main.encode_base64(self.private_key), output)
-        self.assertIn(main.encode_base32(self.private_key), output)
-        self.assertIn("do not log or share", output)
+        self.assertTrue(
+            main.encode_base64(self.private_key) in output,
+            "private-key output invariant failed",
+        )
+        self.assertTrue(
+            main.encode_base32(self.private_key) in output,
+            "private-key output invariant failed",
+        )
+        self.assertTrue(
+            "do not log or share" in output, "private-key output invariant failed"
+        )
 
     def test_base64_encoding_is_rnid_url_safe(self):
         self.assertEqual(main.encode_base64(b"\xfb\xff"), "-_8=")
@@ -645,11 +700,13 @@ class CLITests(unittest.TestCase):
             address = main.lxmf_hash_hex_for_identity(reloaded)
             self.assertTrue(address.startswith("a"))
             self.assertTrue(address.endswith("f"))
-            self.assertNotIn(
-                main.encode_base64(reloaded.get_private_key()), stdout.getvalue()
+            self.assertTrue(
+                main.encode_base64(reloaded.get_private_key()) not in stdout.getvalue(),
+                "private-key output invariant failed",
             )
-            self.assertNotIn(
-                main.encode_base32(reloaded.get_private_key()), stdout.getvalue()
+            self.assertTrue(
+                main.encode_base32(reloaded.get_private_key()) not in stdout.getvalue(),
+                "private-key output invariant failed",
             )
 
     def test_real_postfix_only_search(self):

@@ -457,7 +457,6 @@ def _exclusive_output_fd(path: str) -> int:
         fd = os.open(path, flags, 0o600)
         created_stat = os.fstat(fd)
         created_inode = created_stat.st_dev, created_stat.st_ino
-        os.set_inheritable(fd, False)
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
         return fd
@@ -614,7 +613,7 @@ class OutputStaging:
         self.private_key_verified = True
 
     def write_and_publish(self, private_key: bytes, expected_address: str) -> str:
-        """Share the exact key/address verification used by the CLI and helper."""
+        """Publish the staged identity and verify the winning key and address."""
         if not self.private_key_verified:
             self.write_private_key(private_key)
         saved_path = self.publish()
@@ -781,7 +780,6 @@ def prepare_output_staging(path: str) -> OutputStaging:
             suffix=OUTPUT_STAGING_SUFFIX,
             dir=parent,
         )
-        os.set_inheritable(fd, False)
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
         staging_stat = os.fstat(fd)
@@ -842,41 +840,6 @@ def prepare_output_staging(path: str) -> OutputStaging:
         if isinstance(exc, OSError):
             raise ValueError(f"could not prepare private output: {exc}") from exc
         raise
-
-
-def secure_write_identity(path: str, private_key_bytes: bytes) -> str:
-    """Publish a mode-0600 RNS identity without overwrite or key loss."""
-    private_key = _validate_private_key_bytes(private_key_bytes)
-    try:
-        staging = prepare_output_staging(path)
-    except ValueError as exc:
-        raise OutputWriteError(str(exc)) from exc
-
-    try:
-        identity = RNS.Identity.from_bytes(private_key)
-        if identity is None:
-            raise OutputWriteError("could not reconstruct the identity")
-        saved_path = staging.write_and_publish(
-            private_key, lxmf_hash_hex_for_identity(identity)
-        )
-        extra_private_path = staging.finalize()
-        if extra_private_path is not None:
-            print_diagnostic(
-                f"WARNING: additional private-key link remains at {extra_private_path!r}."
-            )
-        return saved_path
-    except Exception as exc:
-        recovery_path = staging.cleanup()
-        recovery = (
-            f" Private key preserved at {recovery_path!r}."
-            if recovery_path is not None
-            else ""
-        )
-        if isinstance(exc, OutputWriteError):
-            raise OutputWriteError(f"{exc}{recovery}") from exc
-        raise OutputWriteError(f"Could not save output: {exc}.{recovery}") from exc
-    finally:
-        staging.cleanup()
 
 
 def _matches_patterns(addr_hex: str, prefix_hex: str, postfix_hex: str) -> bool:
