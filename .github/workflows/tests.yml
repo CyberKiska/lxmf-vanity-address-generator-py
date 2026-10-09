@@ -44,6 +44,9 @@ jobs:
       - name: Audit runtime dependencies
         run: python -m pip_audit --requirement requirements.txt --progress-spinner off
 
+      - name: Audit installed environment
+        run: python -m pip_audit --progress-spinner off
+
   test:
     name: ${{ matrix.os }} / Python 3.14
     runs-on: ${{ matrix.os }}

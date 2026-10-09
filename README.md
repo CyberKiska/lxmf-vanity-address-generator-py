@@ -214,7 +214,19 @@ Private-key encodings are not printed by default. With
 `--show-private-import-strings`, the program prints the URL-safe Base64 and
 Base32 forms used by RNS `rnid`. They are unencrypted copies of the private key
 and can leak through terminal scrollback, shell redirection, CI logs, screen
-sharing, or support transcripts.
+sharing, or support transcripts. A warning is printed when stdout is not a
+terminal.
+
+About one URL-safe Base64 string in 64 begins with `-`, which `rnid -M <string>`
+reads as an option. Use the attached form instead:
+
+```sh
+python -m RNS.Utilities.rnid --import-prv=<string> -H lxmf.delivery
+```
+
+A private key on a command line can be recorded in shell history and is
+visible to other local users through the process list; prefer importing the
+saved identity file.
 
 ## Performance and shutdown behavior
 
@@ -256,8 +268,10 @@ An interrupt path preserves a late verified winner for recovery and retains the
 signal-derived exit status.
 
 On POSIX systems, SIGINT (Ctrl+C), SIGTERM and SIGHUP request coordinated
-shutdown. Windows handlers cover Ctrl+C and Ctrl+Break; closing the Windows
-console window cannot be intercepted through Python's `signal` module. Signals
+shutdown. On Windows, Ctrl+C and Ctrl+Break are routed to the same handlers,
+but this is so far covered only by synthetic tests, not a recorded console run;
+closing the console window cannot be intercepted through Python's `signal`
+module. Signals
 are handled at safe checkpoints so they cannot split private-key filesystem
 transactions. If a signal arrives after a verified match is held on the normal
 search path, the program finishes publication and verification and reports
@@ -274,8 +288,10 @@ Exit codes are:
 Status, warnings and errors go to `stderr` and are best effort: a closed reader
 or unencodable diagnostic does not stop the search. Results go to `stdout`; if
 that stream fails after publication, the saved identity remains a success and a
-warning is attempted on `stderr`. Result paths use encoding escapes where
-needed. Check the output path if either stream is unavailable.
+warning is attempted on `stderr`. A stream that is already closed at launch
+(`>&-`, `2>&-`) is discarded rather than mixed into the other one. Result paths
+use encoding escapes where needed. Check the output path if either stream is
+unavailable.
 
 ## Verification
 
