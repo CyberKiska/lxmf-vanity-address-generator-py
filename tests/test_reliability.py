@@ -443,6 +443,20 @@ class StreamReliabilityTests(unittest.TestCase):
                     self.assertNotIn("[ready]", other.getvalue())
                     self.assertIn("Identity Found", other.getvalue())
 
+    def test_private_strings_to_non_terminal_stdout_are_warned_about(self):
+        for show, expected in ((True, True), (False, False)):
+            with self.subTest(show=show), tempfile.TemporaryDirectory() as directory:
+                stdout, stderr = io.StringIO(), io.StringIO()
+                argv = ["--prefix=a", "--workers=1", "--out=" + directory + "/id"]
+                if show:
+                    argv.append("--show-private-import-strings")
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    self.assertEqual(main.main(argv), 0, stderr.getvalue())
+                self.assertEqual("non-terminal stdout" in stderr.getvalue(), expected)
+
     @unittest.skipUnless(os.name == "posix", "POSIX shell redirection required")
     def test_real_streams_closed_at_launch(self):
         for redirect in (">&-", "2>&-"):

@@ -169,6 +169,13 @@ class _DiscardingStream(io.TextIOBase):
         return len(text)
 
 
+def _is_terminal(stream: object) -> bool:
+    try:
+        return bool(stream.isatty())  # type: ignore[attr-defined]
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def replace_unusable_std_streams() -> None:
     """Route a missing or closed stdout/stderr to a sink before any output.
 
@@ -1404,6 +1411,11 @@ def run_generation(
             print_diagnostic(
                 f"Expected average attempts: {nominal_attempts:,} "
                 f"({difficulty_bits} constrained bits)."
+            )
+        if args.show_private_import_strings and not _is_terminal(sys.stdout):
+            print_diagnostic(
+                "WARNING: --show-private-import-strings will write the private "
+                "key to a non-terminal stdout (file, pipe or log)."
             )
 
         started_at = time.perf_counter()
