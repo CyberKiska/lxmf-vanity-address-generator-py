@@ -6,6 +6,7 @@ import argparse
 import base64
 from dataclasses import dataclass, field
 import errno
+import io
 import json
 import multiprocessing as mp
 from multiprocessing.connection import Connection, wait
@@ -156,6 +157,29 @@ def print_diagnostic(message: str) -> None:
         print(message, file=sys.stderr, flush=True)
     except (OSError, ValueError):
         silence_dead_stream(sys.stderr)
+
+
+class _DiscardingStream(io.TextIOBase):
+    """Text sink without a file descriptor, used when stdio is unavailable."""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        return len(text)
+
+
+def replace_unusable_std_streams() -> None:
+    """Route a missing or closed stdout/stderr to a sink before any output.
+
+    A stream closed at launch (``>&-``) is ``None``; ``print(file=None)`` would
+    then write diagnostics to stdout, and Python 3.14's argparse probes
+    ``isatty()`` on a closed stream while building the parser.
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if stream is None or getattr(stream, "closed", False):
+            setattr(sys, name, _DiscardingStream())
 
 
 def lxmf_hash_hex_for_identity(identity: RNS.Identity) -> str:
@@ -1535,6 +1559,7 @@ def run_generation(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    replace_unusable_std_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
     disable_core_dumps()

@@ -404,14 +404,65 @@ class StreamReliabilityTests(unittest.TestCase):
     def test_closed_text_wrapper_does_not_abort_generation(self):
         stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
         stream.close()
+        # Argparse probes the terminal unless colour is disabled; keep the
+        # probe enabled so the result does not depend on the caller's shell.
+        colour_env = {"TERM": "xterm-256color", "NO_COLOR": "", "PYTHON_COLORS": ""}
         with tempfile.TemporaryDirectory() as directory:
             stderr = io.StringIO()
-            with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stderr):
+            with (
+                mock.patch.dict(os.environ, colour_env),
+                contextlib.redirect_stdout(stream),
+                contextlib.redirect_stderr(stderr),
+            ):
                 result = main.main(
                     ["--prefix=a", "--workers=1", "--out=" + directory + "/identity"]
                 )
             self.assertEqual(result, 0, stderr.getvalue())
             self.assertIsNotNone(RNS.Identity.from_file(directory + "/identity"))
+
+    def test_missing_std_streams_keep_outputs_separate_and_succeed(self):
+        for name in ("stdout", "stderr"):
+            with self.subTest(stream=name), tempfile.TemporaryDirectory() as directory:
+                other = io.StringIO()
+                other_name = "stderr" if name == "stdout" else "stdout"
+                with (
+                    mock.patch.object(sys, name, None),
+                    mock.patch.object(sys, other_name, other),
+                ):
+                    result = main.main(
+                        [
+                            "--prefix=a",
+                            "--workers=1",
+                            "--out=" + directory + "/identity",
+                        ]
+                    )
+                self.assertEqual(result, 0, other.getvalue())
+                self.assertIsNotNone(RNS.Identity.from_file(directory + "/identity"))
+                if name == "stderr":
+                    # Diagnostics must not fall back to the result stream.
+                    self.assertNotIn("[ready]", other.getvalue())
+                    self.assertIn("Identity Found", other.getvalue())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX shell redirection required")
+    def test_real_streams_closed_at_launch(self):
+        for redirect in (">&-", "2>&-"):
+            with (
+                self.subTest(redirect=redirect),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = directory + "/identity"
+                command = 'exec "$0" "$1" --prefix=a --workers=1 "--out=$2" ' + redirect
+                result = subprocess.run(
+                    ["/bin/sh", "-c", command, sys.executable, main.__file__, path],
+                    capture_output=redirect == "2>&-",
+                    env={**os.environ, "TERM": "xterm-256color", "NO_COLOR": ""},
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIsNotNone(RNS.Identity.from_file(path))
+                if redirect == "2>&-":
+                    self.assertNotIn(b"[ready]", result.stdout)
+                    self.assertIn(b"Identity Found", result.stdout)
 
     def test_devnull_descriptor_reuse_does_not_close_repaired_descriptor(self):
         stream = mock.Mock()
