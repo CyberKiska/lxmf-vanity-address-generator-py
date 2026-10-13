@@ -201,7 +201,6 @@ class MatchPreservationTests(unittest.TestCase):
                     "staged winner was replaced",
                 )
 
-    # T1.1
     def test_worker_shutdown_failure_after_match_still_publishes(self):
         real_collect = main.collect_worker_shutdown
         fired = []
@@ -224,7 +223,6 @@ class MatchPreservationTests(unittest.TestCase):
             self.assertIn("WARNING: worker processes did not stop", stderr.getvalue())
             self.assert_saved(directory)
 
-    # T1.1
     def test_signal_after_match_still_publishes(self):
         real_collect = main.collect_worker_shutdown
         fired = []
@@ -247,7 +245,6 @@ class MatchPreservationTests(unittest.TestCase):
             self.assertIn("termination signal arrived", stderr.getvalue())
             self.assert_saved(directory)
 
-    # T1.1 (D4)
     def test_late_match_on_interrupt_path_is_preserved_for_recovery(self):
         identity = RNS.Identity(create_keys=True)
         key = identity.get_private_key()
@@ -296,7 +293,6 @@ class MatchPreservationTests(unittest.TestCase):
             )
             self.assertFalse(os.path.lexists(os.path.join(directory, "identity")))
 
-    # T1.2
     def test_dead_status_stream_does_not_stop_the_search(self):
         with tempfile.TemporaryDirectory() as directory:
             result, stdout, _ = self.run_main(directory, stderr=_DeadStream())
@@ -304,7 +300,6 @@ class MatchPreservationTests(unittest.TestCase):
             self.assertIn("Identity Found", stdout.getvalue())
             self.assert_saved(directory)
 
-    # T1.2
     def test_dead_result_stream_after_publication_is_still_success(self):
         with tempfile.TemporaryDirectory() as directory:
             result, _, stderr = self.run_main(directory, stdout=_DeadStream())
@@ -312,7 +307,6 @@ class MatchPreservationTests(unittest.TestCase):
             self.assertIn("could not be written to stdout", stderr.getvalue())
             self.assert_saved(directory)
 
-    # T1.3
     def test_interrupted_wait_becomes_coordinated_sigint(self):
         real_wait = main.wait
         fired = []
@@ -344,6 +338,66 @@ class MatchPreservationTests(unittest.TestCase):
             self.assertIn("Interrupted", stderr.getvalue())
             self.assertNotIn("ERROR", stderr.getvalue())
             self.assertEqual(os.listdir(directory), [])
+
+
+class OutputCloseFailureTests(unittest.TestCase):
+    def test_copy_close_error_removes_final_and_preserves_staging(self):
+        for partial in (False, True):
+            with (
+                self.subTest(partial=partial),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                staging = main.prepare_output_staging(directory + "/identity")
+                staging.write_private_key(main.COMPAT_PRIVATE_KEY)
+                staging.publish_mode = main.PUBLISH_EXCLUSIVE_COPY
+                real_close, real_write = os.close, main._write_all
+
+                def close_then_fail(fd):
+                    real_close(fd)
+                    raise OSError(errno.EIO, "delayed close failure")
+
+                def write(fd, data):
+                    if partial:
+                        os.write(fd, data[:8])
+                        raise OSError(errno.ENOSPC, "disk full")
+                    real_write(fd, data)
+
+                try:
+                    with (
+                        mock.patch.object(os, "close", side_effect=close_then_fail),
+                        mock.patch.object(main, "_write_all", side_effect=write),
+                    ):
+                        with self.assertRaisesRegex(
+                            main.OutputWriteError,
+                            "disk full" if partial else "delayed close failure",
+                        ):
+                            staging.publish()
+                    self.assertFalse(os.path.lexists(staging.final_path))
+                    self.assertFalse(staging.final_published)
+                finally:
+                    recovery = staging.cleanup()
+                self.assertTrue(
+                    RNS.Identity.from_file(recovery).get_private_key()
+                    == main.COMPAT_PRIVATE_KEY,
+                    "recovery key differs",
+                )
+
+    def test_staging_close_error_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staging = main.prepare_output_staging(directory + "/identity")
+            staging.write_private_key(main.COMPAT_PRIVATE_KEY)
+            real_close = os.close
+
+            def close_then_fail(fd):
+                real_close(fd)
+                raise OSError(errno.EIO, "delayed close failure")
+
+            with mock.patch.object(os, "close", side_effect=close_then_fail) as close:
+                with self.assertRaises(OSError):
+                    staging.cleanup()
+                recovery = staging.cleanup()
+                close.assert_called_once()
+            self.assertEqual(recovery, staging.staging_path)
 
 
 class StreamReliabilityTests(unittest.TestCase):

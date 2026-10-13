@@ -26,7 +26,7 @@ try:
     import RNS
 except ImportError as exc:  # pragma: no cover - exercised without the dependency
     raise SystemExit(
-        "ERROR: Reticulum could not be imported. Install them with "
+        "ERROR: Reticulum could not be imported. Install it with "
         "'python -m pip install -r requirements.txt'."
     ) from exc
 
@@ -607,8 +607,10 @@ class OutputStaging:
 
     def _close_fd(self) -> None:
         if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
+            # A failed close may already have released the descriptor. Never
+            # retry it: that number may now refer to an unrelated open file.
+            fd, self.fd = self.fd, -1
+            os.close(fd)
 
     def write_private_key(self, private_key_bytes: object) -> None:
         private_key = _validate_private_key_bytes(private_key_bytes)
@@ -719,7 +721,11 @@ class OutputStaging:
                 publish_error = exc
             finally:
                 if output_fd >= 0:
-                    os.close(output_fd)
+                    try:
+                        os.close(output_fd)
+                    except OSError as exc:
+                        if publish_error is None:
+                            publish_error = exc
             if publish_error is not None:
                 if _unlink_if_inode(self.final_path, output_inode):
                     self.final_published = False
