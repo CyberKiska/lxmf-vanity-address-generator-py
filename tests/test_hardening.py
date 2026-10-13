@@ -213,15 +213,14 @@ class FullFlushTests(unittest.TestCase):
         events = []
         fcntl = mock.Mock(F_FULLFSYNC=51)
         fcntl.fcntl.side_effect = lambda *args: events.append("full flush")
-        for platform, expected in (
-            ("darwin", ["fsync", "full flush"]),
-            ("linux", ["fsync"]),
-            ("win32", ["fsync"]),
+        for requested, expected in (
+            (True, ["fsync", "full flush"]),
+            (False, ["fsync"]),
         ):
             events.clear()
             with (
-                self.subTest(platform=platform),
-                mock.patch.object(main.sys, "platform", platform),
+                self.subTest(requested=requested),
+                mock.patch.object(main, "REQUEST_FULL_FSYNC", requested),
                 mock.patch.object(main, "fcntl", fcntl, create=True),
                 mock.patch.object(
                     os, "fsync", side_effect=lambda fd: events.append("fsync")
@@ -230,6 +229,9 @@ class FullFlushTests(unittest.TestCase):
                 main._flush_fd(42)
             self.assertEqual(events, expected)
 
+    def test_full_flush_is_requested_on_macos_only(self):
+        self.assertEqual(main.REQUEST_FULL_FSYNC, sys.platform == "darwin")
+
     def test_absent_and_unsupported_full_flush_warn_after_fsync(self):
         for error in (None, errno.EINVAL, errno.ENOTSUP, errno.ENOSYS, errno.ENOTTY):
             fcntl = mock.Mock(F_FULLFSYNC=51) if error is not None else None
@@ -237,7 +239,7 @@ class FullFlushTests(unittest.TestCase):
                 fcntl.fcntl.side_effect = OSError(error, "unsupported")
             with (
                 self.subTest(errno=error),
-                mock.patch.object(main.sys, "platform", "darwin"),
+                mock.patch.object(main, "REQUEST_FULL_FSYNC", True),
                 mock.patch.object(main, "fcntl", fcntl, create=True),
                 mock.patch.object(os, "fsync") as fsync,
                 contextlib.redirect_stderr(io.StringIO()) as stderr,
@@ -253,7 +255,7 @@ class FullFlushTests(unittest.TestCase):
             with (
                 self.subTest(errno=error),
                 tempfile.TemporaryDirectory() as directory,
-                mock.patch.object(main.sys, "platform", "darwin"),
+                mock.patch.object(main, "REQUEST_FULL_FSYNC", True),
                 mock.patch.object(main, "fcntl", fcntl, create=True),
             ):
                 with self.assertRaisesRegex(ValueError, "full flush I/O failure"):
@@ -275,7 +277,7 @@ class FullFlushTests(unittest.TestCase):
                     fcntl = mock.Mock(F_FULLFSYNC=51)
                     fcntl.fcntl.side_effect = OSError(error, "full flush I/O failure")
                     with (
-                        mock.patch.object(main.sys, "platform", "darwin"),
+                        mock.patch.object(main, "REQUEST_FULL_FSYNC", True),
                         mock.patch.object(main, "fcntl", fcntl, create=True),
                     ):
                         with self.assertRaisesRegex(
@@ -293,7 +295,7 @@ class FullFlushTests(unittest.TestCase):
     def test_ordinary_fsync_failure_prevents_full_flush(self):
         fcntl = mock.Mock(F_FULLFSYNC=51)
         with (
-            mock.patch.object(main.sys, "platform", "darwin"),
+            mock.patch.object(main, "REQUEST_FULL_FSYNC", True),
             mock.patch.object(main, "fcntl", fcntl, create=True),
             mock.patch.object(
                 os, "fsync", side_effect=OSError(errno.EIO, "I/O failure")
@@ -315,7 +317,7 @@ class FullFlushTests(unittest.TestCase):
                 fcntl.fcntl.side_effect = fail_key_flush
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with (
-                    mock.patch.object(main.sys, "platform", "darwin"),
+                    mock.patch.object(main, "REQUEST_FULL_FSYNC", True),
                     mock.patch.object(main, "fcntl", fcntl),
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),

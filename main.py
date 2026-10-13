@@ -391,10 +391,15 @@ UNSUPPORTED_FULL_FLUSH_ERRNOS = frozenset(
 )
 
 
+# Read once at import; tests patch this flag instead of the process-wide
+# sys.platform, which multiprocessing also consults.
+REQUEST_FULL_FSYNC = sys.platform == "darwin"
+
+
 def _flush_fd(fd: int) -> None:
     """fsync, then request a full drive-cache flush on macOS."""
     os.fsync(fd)
-    if sys.platform != "darwin":
+    if not REQUEST_FULL_FSYNC:
         return
     full_fsync = getattr(fcntl, "F_FULLFSYNC", None)
     if full_fsync is None:
