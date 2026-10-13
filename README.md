@@ -5,7 +5,7 @@ A security-focused command-line generator for a Reticulum identity whose final
 both.
 
 Startup known-answer tests check the key layout and address derivation of the
-installed Reticulum package. Local verification on 2026-10-09 used **RNS 1.5.7**
+installed Reticulum package. Local verification on 2026-10-13 used **RNS 1.5.7**
 and **cryptography 50.0.2** on CPython 3.14.7 under macOS. The installation
 minimum is RNS 1.5.2; historical checks on older releases do not establish
 production support. Key generation and address derivation use the official
