@@ -1,4 +1,6 @@
+# Startup vectors check the relied-on protocol contract. CI tests the
+# latest stable release; 1.5.2 is the chosen installation minimum.
+rns>=1.5.2
+# Supported crypto provider; minimum from the dated advisory review.
+# Audit the actual resolved environment again before release.
 cryptography>=50.0.0
-packaging>=24.0
-pyserial>=3.5
-rns>=1.5.2,<2.0
