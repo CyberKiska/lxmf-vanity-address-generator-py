@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import io
 import errno
@@ -80,18 +81,35 @@ class PrivateVectorTests(unittest.TestCase):
 
 
 class ReferenceInteropTests(unittest.TestCase):
-    def test_official_rnid_derives_the_same_address_from_the_saved_file(self):
-        identity = RNS.Identity(create_keys=True)
-        expected = main.lxmf_hash_hex_for_identity(identity)
+    def test_cli_address_matches_official_api_and_rnid_from_the_saved_file(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "identity")
-            staging = main.prepare_output_staging(path)
-            try:
-                staging.write_and_publish(identity.get_private_key(), expected)
-                staging.finalize()
-            finally:
-                staging.cleanup()
-            completed = subprocess.run(
+            generator = subprocess.run(
+                [
+                    sys.executable,
+                    main.__file__,
+                    "--prefix=a",
+                    "--workers=1",
+                    "--out",
+                    path,
+                ],
+                cwd=directory,
+                capture_output=True,
+                timeout=120,
+            )
+            self.assertEqual(generator.returncode, 0)
+            self.assertEqual(os.path.getsize(path), 64)
+            identity = RNS.Identity.from_file(path)
+            self.assertIsNotNone(identity)
+            expected = RNS.Destination.hash(identity, "lxmf", "delivery")
+            self.assertEqual(len(expected), 16)
+            self.assertTrue(expected.hex().startswith("a"))
+            line = f"LXMF addr   : {expected.hex()}".encode("ascii")
+            self.assertTrue(
+                line in generator.stdout.splitlines(), "CLI address mismatch"
+            )
+
+            rnid = subprocess.run(
                 [
                     sys.executable,
                     "-m",
@@ -103,13 +121,30 @@ class ReferenceInteropTests(unittest.TestCase):
                     "-H",
                     "lxmf.delivery",
                 ],
+                cwd=directory,
                 capture_output=True,
-                text=True,
                 timeout=120,
             )
-            output = completed.stdout + completed.stderr
-            self.assertEqual(completed.returncode, 0, output)
-            self.assertIn(f"<{expected}>", completed.stdout)
+            self.assertEqual(rnid.returncode, 0)
+            self.assertTrue(
+                f"<{expected.hex()}>".encode("ascii") in rnid.stdout,
+                "rnid address mismatch",
+            )
+            # A regression must not copy private output into the test failure.
+            key = identity.get_private_key()
+            output = generator.stdout + generator.stderr + rnid.stdout + rnid.stderr
+            self.assertFalse(
+                any(
+                    value in output
+                    for value in (
+                        key,
+                        key.hex().encode("ascii"),
+                        base64.urlsafe_b64encode(key),
+                        base64.b32encode(key),
+                    )
+                ),
+                "private key appeared in captured output",
+            )
             # rnid must not have needed a Reticulum instance for this.
             self.assertEqual(os.listdir(directory), ["identity"])
 
