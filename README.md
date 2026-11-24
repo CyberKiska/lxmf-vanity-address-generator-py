@@ -4,12 +4,17 @@ A security-focused command-line generator for a Reticulum identity whose final
 `lxmf.delivery` destination hash has a chosen hexadecimal prefix, postfix, or
 both.
 
-Startup known-answer tests check the key layout and address derivation of the
-installed Reticulum package. Local verification on 2026-10-13 used **RNS 1.5.7**
-and **cryptography 50.0.2** on CPython 3.14.7 under macOS. The installation
-minimum is RNS 1.5.2; historical checks on older releases do not establish
-production support. Key generation and address derivation use the official
-public API:
+The 2026-11-24 release-candidate check used clean installations on macOS
+27.2.1 (arm64) with CPython 3.14.3:
+
+| Installation | RNS | PyCA cryptography |
+| --- | --- | --- |
+| Documented minimum | 1.5.2 | 50.0.0 |
+| Current stable resolution | 1.6.1 | 50.0.2 |
+
+Each installation generated a disposable identity. Both versions loaded both
+files with the Reticulum API and `rnid` and reproduced the CLI's
+`lxmf.delivery` address. Key generation and derivation use the official API:
 
 ```python
 identity = RNS.Identity(create_keys=True)
@@ -145,12 +150,13 @@ silently treated as unsupported. These requests improve durability but do not
 guarantee recovery after every device failure or power loss.
 
 On handled failures, the generator retains staging that may contain private
-key material and reports its path as `RECOVERY:`. A staging write can be partial,
-and a failed flush cannot establish durability; verify a recovery identity with
-RNS before using it. Recovery reporting identifies a possible secret file, not
-a guarantee that it contains a complete usable key. If flushing staging-name
-removal fails after the final identity has already been committed, the error identifies the
-saved final file instead. A failed run can therefore leave an identity at the
+key material and reports its path as `RECOVERY:`. When a winner was verified,
+the diagnostic includes its public destination. A staging write can be partial.
+Before using the file, check that it is 64 bytes and use the `rnid` command
+below with the recovery path. Its destination must match the reported winner.
+A failed flush leaves durability uncertain. If flushing staging-name removal
+fails after the final identity has already been committed, the error identifies
+the saved final file. A failed run can therefore leave an identity at the
 requested path; inspect the reported paths before retrying. Treat every
 file named `.lxmf-identity-*.staging` as secret: a force kill, power loss, or
 process crash can leave either a harmless preflight marker or private key
@@ -320,9 +326,10 @@ SIGHUP tests wait for active workers in isolated process groups before signallin
 Synthetic Windows signal tests validate control flow; a real console run is
 still required to establish OS console behavior.
 
-GitHub Actions runs these quality checks and the functional suite against the
-latest stable resolved dependencies on Python 3.14 under Linux, macOS and
-Windows, on pushes, pull requests and weekly. It records resolved dependencies
+GitHub Actions runs quality checks on Linux. The functional suite runs twice on
+Python 3.14 under Linux, macOS and Windows, once with the two installation
+minimums pinned and once with the latest stable resolution. The workflow runs on
+pushes, pull requests and weekly. It records resolved dependencies
 and keeps official actions pinned to immutable commit hashes. Weekly checks can
 detect regressions after a release is available; they are not an installation
 gate. [GitHub may disable scheduled workflows after 60 days of inactivity in
