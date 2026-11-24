@@ -483,7 +483,7 @@ def _link_without_following(source: str, destination: str) -> None:
         ) from exc
 
 
-def _exclusive_output_fd(path: str) -> int:
+def _exclusive_output_fd(path: str) -> tuple[int, tuple[int, int]]:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW"):
         flags |= getattr(os, flag_name, 0)
@@ -495,7 +495,7 @@ def _exclusive_output_fd(path: str) -> int:
         created_inode = created_stat.st_dev, created_stat.st_ino
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
-        return fd
+        return fd, created_inode
     except BaseException:
         if fd >= 0 and created_inode is None:
             try:
@@ -503,9 +503,11 @@ def _exclusive_output_fd(path: str) -> int:
                 created_inode = created_stat.st_dev, created_stat.st_ino
             except OSError:
                 pass
-        if fd >= 0:
-            os.close(fd)
-        _unlink_if_inode(path, created_inode)
+        try:
+            if fd >= 0:
+                os.close(fd)
+        finally:
+            _unlink_if_inode(path, created_inode)
         raise
 
 
@@ -537,22 +539,21 @@ def _new_output_probe_path(parent: str, minimum_name_length: int) -> str:
     """Return an absent probe path at least as long as the final basename."""
     padding_length = 0
     for _attempt in range(2):
-        probe_fd = -1
-        probe_path: str | None = None
         probe_inode: tuple[int, int] | None = None
+        probe_fd, probe_path = tempfile.mkstemp(
+            prefix=OUTPUT_STAGING_PREFIX,
+            suffix=("x" * padding_length) + ".probe",
+            dir=parent,
+        )
         try:
-            probe_fd, probe_path = tempfile.mkstemp(
-                prefix=OUTPUT_STAGING_PREFIX,
-                suffix=("x" * padding_length) + ".probe",
-                dir=parent,
-            )
             probe_stat = os.fstat(probe_fd)
             probe_inode = probe_stat.st_dev, probe_stat.st_ino
         finally:
-            if probe_fd >= 0:
+            try:
                 os.close(probe_fd)
-
-        if probe_path is None or not _unlink_if_inode(probe_path, probe_inode):
+            finally:
+                removed = _unlink_if_inode(probe_path, probe_inode)
+        if not removed:
             raise OSError("could not prepare a temporary output publication probe")
         actual_length = _path_component_length(os.path.basename(probe_path))
         if actual_length >= minimum_name_length:
@@ -563,31 +564,17 @@ def _new_output_probe_path(parent: str, minimum_name_length: int) -> str:
 
 
 def _preflight_exclusive_copy(probe_path: str) -> None:
-    probe_fd = -1
-    probe_inode: tuple[int, int] | None = None
+    probe_fd, probe_inode = _exclusive_output_fd(probe_path)
     try:
-        probe_fd = _exclusive_output_fd(probe_path)
-        probe_stat = os.fstat(probe_fd)
-        probe_inode = probe_stat.st_dev, probe_stat.st_ino
         _write_all(probe_fd, OUTPUT_STAGING_MARKER)
         _flush_fd(probe_fd)
-    except BaseException:
-        if probe_fd >= 0 and probe_inode is None:
-            try:
-                probe_stat = os.fstat(probe_fd)
-                probe_inode = probe_stat.st_dev, probe_stat.st_ino
-            except OSError:
-                pass
-        if probe_fd >= 0:
-            os.close(probe_fd)
-            probe_fd = -1
-        _unlink_if_inode(probe_path, probe_inode)
-        raise
     finally:
-        if probe_fd >= 0:
+        try:
             os.close(probe_fd)
+        finally:
+            removed = _unlink_if_inode(probe_path, probe_inode)
 
-    if not _unlink_if_inode(probe_path, probe_inode):
+    if not removed:
         raise OSError(f"could not remove output preflight file {probe_path!r}")
 
 
@@ -628,9 +615,10 @@ class OutputStaging:
         self.may_contain_private_key = True
         self.private_key_verified = False
         try:
+            # Leave exactly the bytes written if storage fails mid-write.
+            os.ftruncate(self.fd, 0)
             os.lseek(self.fd, 0, os.SEEK_SET)
             _write_all(self.fd, private_key)
-            os.ftruncate(self.fd, len(private_key))
             _flush_fd(self.fd)
         except OSError as exc:
             raise OutputWriteError(
@@ -640,13 +628,14 @@ class OutputStaging:
 
         try:
             reloaded = RNS.Identity.from_file(self.staging_path)
-            if reloaded is None or reloaded.get_private_key() != private_key:
-                raise ValueError("staged identity did not round-trip through RNS")
-        except Exception as exc:
+            matches = reloaded is not None and reloaded.get_private_key() == private_key
+        except Exception:
+            matches = False
+        if not matches:
             raise OutputWriteError(
-                "Staged private-key verification failed; the staging file was "
-                f"preserved at {self.staging_path!r}: {exc}"
-            ) from exc
+                "Staged private-key verification failed. The staging file was "
+                f"preserved at {self.staging_path!r}."
+            )
 
         self.private_key_verified = True
 
@@ -657,15 +646,14 @@ class OutputStaging:
         saved_path = self.publish()
         try:
             reloaded = RNS.Identity.from_file(saved_path)
-            if (
-                reloaded is None
-                or reloaded.get_private_key() != private_key
-                or lxmf_hash_hex_for_identity(reloaded) != expected_address
-            ):
-                raise ValueError(
-                    "saved identity does not reproduce the winning key and address"
-                )
-        except Exception as exc:
+            matches = (
+                reloaded is not None
+                and reloaded.get_private_key() == private_key
+                and lxmf_hash_hex_for_identity(reloaded) == expected_address
+            )
+        except Exception:
+            matches = False
+        if not matches:
             removed = self.remove_published_final()
             cleanup = (
                 "removed invalid final output"
@@ -673,8 +661,8 @@ class OutputStaging:
                 else f"could not remove {saved_path!r}"
             )
             raise OutputWriteError(
-                f"Output verification failed; {cleanup}: {exc}"
-            ) from exc
+                f"Could not verify the winning key and address at {saved_path!r}: {cleanup}."
+            )
         return saved_path
 
     def publish(self) -> str:
@@ -712,9 +700,7 @@ class OutputStaging:
             output_inode: tuple[int, int] | None = None
             publish_error: BaseException | None = None
             try:
-                output_fd = _exclusive_output_fd(self.final_path)
-                output_stat = os.fstat(output_fd)
-                output_inode = output_stat.st_dev, output_stat.st_ino
+                output_fd, output_inode = _exclusive_output_fd(self.final_path)
                 os.lseek(self.fd, 0, os.SEEK_SET)
                 private_key = _read_exact(self.fd, RNS.Identity.KEYSIZE // 8)
                 _write_all(output_fd, private_key)
@@ -771,7 +757,12 @@ class OutputStaging:
         """Remove the staging name after final output has been verified."""
         if not self.final_published:
             raise OutputWriteError("cannot finalize output before publication")
-        self._close_fd()
+        try:
+            self._close_fd()
+        except OSError as exc:
+            raise OutputWriteError(
+                f"Could not close staging after verifying the final identity at {self.final_path!r}: {exc}"
+            ) from exc
         try:
             os.unlink(self.staging_path)
         except OSError:
@@ -835,7 +826,17 @@ def prepare_output_staging(path: str) -> OutputStaging:
 
         try:
             _link_without_following(staging_path, probe_path)
-        except (OSError, ValueError) as link_exc:
+        except OSError as link_exc:
+            # EPERM can mean this filesystem does not implement hard links.
+            # Windows reports ERROR_INVALID_FUNCTION or ERROR_NOT_SUPPORTED.
+            if link_exc.errno not in {
+                errno.ENOTSUP,
+                errno.ENOSYS,
+                errno.EPERM,
+                errno.EXDEV,
+                errno.EMLINK,
+            } and getattr(link_exc, "winerror", None) not in {1, 50}:
+                raise
             try:
                 _preflight_exclusive_copy(probe_path)
             except (OSError, ValueError) as copy_exc:
@@ -870,13 +871,19 @@ def prepare_output_staging(path: str) -> OutputStaging:
     except BaseException as exc:
         if probe_path is not None:
             _unlink_if_inode(probe_path, staging_inode)
-        if fd >= 0:
-            os.close(fd)
-        if staging_path is not None:
-            try:
-                os.unlink(staging_path)
-            except OSError:
-                pass
+        try:
+            if fd >= 0:
+                os.close(fd)
+        except OSError as close_exc:
+            raise ValueError(
+                f"could not close output preflight file: {close_exc}"
+            ) from close_exc
+        finally:
+            if staging_path is not None:
+                try:
+                    os.unlink(staging_path)
+                except OSError:
+                    pass
         if isinstance(exc, ValueError):
             raise
         if isinstance(exc, OSError):

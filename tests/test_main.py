@@ -372,13 +372,15 @@ class SecureOutputTests(unittest.TestCase):
                 "private-key output invariant failed",
             )
             with open(path, "rb") as handle:
-                self.assertEqual(handle.read(), competitor)
+                self.assertTrue(handle.read() == competitor, "existing output changed")
 
     def test_hard_link_unsupported_uses_exclusive_copy_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "identity")
             with mock.patch.object(
-                main, "_link_without_following", side_effect=OSError("unsupported")
+                main,
+                "_link_without_following",
+                side_effect=OSError(errno.ENOTSUP, "unsupported"),
             ):
                 staging = main.prepare_output_staging(path)
 
@@ -491,7 +493,9 @@ class SecureOutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "identity")
             with mock.patch.object(
-                main, "_link_without_following", side_effect=OSError("unsupported")
+                main,
+                "_link_without_following",
+                side_effect=OSError(errno.ENOTSUP, "unsupported"),
             ):
                 staging = main.prepare_output_staging(path)
             staging.write_private_key(self.private_key)
