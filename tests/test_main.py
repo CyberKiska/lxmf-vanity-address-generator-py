@@ -149,7 +149,7 @@ class RNSCompatibilityTests(unittest.TestCase):
 
         wrong_prefix = "0" if address[0] != "0" else "1"
         error = main.validate_match_payload(private_key, address, wrong_prefix, "")
-        self.assertIsInstance(error, str)
+        self.assertTrue(isinstance(error, str), "mismatched prefix was accepted")
 
     def test_public_compatibility_vector_matches_independent_formula(self):
         identity_hash = hashlib.sha256(main.COMPAT_PUBLIC_KEY).digest()[:16]

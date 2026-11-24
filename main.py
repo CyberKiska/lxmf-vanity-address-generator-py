@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import errno
 import io
@@ -93,29 +94,32 @@ class OutputWriteError(RuntimeError):
 
 
 @dataclass
-class SignalState:
-    """Record the first termination signal for handling at a safe checkpoint."""
-
-    signum: int | None = None
-
-    def request(self, signum: int, _frame: object) -> None:
-        if self.signum is None:
-            self.signum = signum
-
-    def raise_if_requested(self) -> None:
-        if self.signum is not None:
-            raise TerminationRequested(self.signum)
-
-
-@dataclass
 class SearchState:
     total_tries: int = 0
-    match_private_key: bytes | None = None
+    match_private_key: bytes | None = field(default=None, repr=False)
     match_addr_hex: str | None = None
     errors: list[str] = field(default_factory=list)
     ready_workers: set[int] = field(default_factory=set)
     done_workers: set[int] = field(default_factory=set)
     attempt_count_exact: bool = True
+
+
+@dataclass
+class SignalState:
+    """Remember whether the parent held a verified winner at the first signal."""
+
+    search: SearchState = field(default_factory=SearchState)
+    signum: int | None = None
+    had_match: bool = False
+
+    def request(self, signum: int, _frame: object) -> None:
+        if self.signum is None:
+            self.signum = signum
+            self.had_match = self.search.match_private_key is not None
+
+    def raise_if_requested(self) -> None:
+        if self.signum is not None and not self.had_match:
+            raise TerminationRequested(self.signum)
 
 
 @dataclass
@@ -199,6 +203,17 @@ def gen_identity() -> RNS.Identity:
     return RNS.Identity(create_keys=True)
 
 
+@contextmanager
+def quiet_rns_logging():
+    """RNS can log provider exception text, including arguments, on stdout."""
+    previous_level = RNS.loglevel
+    RNS.loglevel = RNS.LOG_NONE
+    try:
+        yield
+    finally:
+        RNS.loglevel = previous_level
+
+
 def rns_version() -> str:
     """Return the version the imported RNS package reports (informational)."""
     return str(getattr(RNS, "__version__", "unknown"))
@@ -210,6 +225,10 @@ def crypto_backend() -> str:
         return str(RNS.Cryptography.backend())
     except Exception:  # This display helper is not part of RNS's public contract.
         return "unknown"
+
+
+class _CompatibilityError(ValueError):
+    """A public explanation of a failed startup check."""
 
 
 def validate_runtime_environment() -> str:
@@ -235,7 +254,9 @@ def validate_runtime_environment() -> str:
         # Verify the exported key as well as the API's return value.
         loaded = known_identity.load_public_key(COMPAT_PUBLIC_KEY)
         if loaded is False or known_identity.get_public_key() != COMPAT_PUBLIC_KEY:
-            raise ValueError("RNS could not load the public compatibility fixture")
+            raise _CompatibilityError(
+                "RNS could not load the public compatibility fixture"
+            )
         if (
             lxmf_hash_hex_for_identity(known_identity) != COMPAT_LXMF_HASH
             or RNS.Destination.hash_from_name_and_identity(
@@ -243,7 +264,9 @@ def validate_runtime_environment() -> str:
             ).hex()
             != COMPAT_LXMF_HASH
         ):
-            raise ValueError("lxmf.delivery destination derivation is incompatible")
+            raise _CompatibilityError(
+                "lxmf.delivery destination derivation is incompatible"
+            )
         # Pin the private-key halves and scalar interpretation to RFC outputs.
         rfc_identity = RNS.Identity.from_bytes(COMPAT_PRIVATE_KEY)
         if (
@@ -251,34 +274,47 @@ def validate_runtime_environment() -> str:
             or rfc_identity.get_public_key() != COMPAT_PRIVATE_KEY_PUBLIC
             or lxmf_hash_hex_for_identity(rfc_identity) != COMPAT_PRIVATE_KEY_LXMF_HASH
         ):
-            raise ValueError("RFC 7748/8032 private-key vector is not reproduced")
+            raise _CompatibilityError(
+                "RFC 7748/8032 private-key vector is not reproduced"
+            )
 
         identity = gen_identity()
         private_key = identity.get_private_key()
         if not isinstance(private_key, bytes) or len(private_key) != 64:
-            raise ValueError("generated identity did not contain a 64-byte key")
+            raise _CompatibilityError(
+                "generated identity did not contain a 64-byte key"
+            )
         # Parent-only startup smoke check, not a continuous RNG health test.
         other_key = gen_identity().get_private_key()
         if not isinstance(other_key, bytes) or len(other_key) != 64:
-            raise ValueError("generated identity did not contain a 64-byte key")
+            raise _CompatibilityError(
+                "generated identity did not contain a 64-byte key"
+            )
         halves = {private_key[:32], private_key[32:], other_key[:32], other_key[32:]}
         if len(halves) != 4:
-            raise ValueError("RNS generated repeated key material")
+            raise _CompatibilityError("RNS generated repeated key material")
         restored = RNS.Identity.from_bytes(private_key)
         if (
             restored is None
             or restored.get_private_key() != private_key
             or restored.get_public_key() != identity.get_public_key()
         ):
-            raise ValueError("identity did not round-trip through RNS")
+            raise _CompatibilityError("identity did not round-trip through RNS")
         derived = lxmf_hash_hex_for_identity(restored)
         official = RNS.Destination.hash_from_name_and_identity(
             "lxmf.delivery", restored
         ).hex()
         if derived != official or len(derived) != 32 or derived != derived.lower():
-            raise ValueError("lxmf.delivery destination derivation is incompatible")
+            raise _CompatibilityError(
+                "lxmf.delivery destination derivation is incompatible"
+            )
+    except _CompatibilityError:
+        raise
     except Exception as exc:
-        raise ValueError(f"RNS public API compatibility check failed: {exc}") from exc
+        # Providers may include their private input in the exception message.
+        raise ValueError(
+            f"RNS public API compatibility check failed ({type(exc).__name__})"
+        ) from None
 
     return f"crypto backend: {crypto_backend()}"
 
@@ -918,6 +954,7 @@ def send_worker_message(connection: Connection, message: tuple) -> None:
     connection.send_bytes(payload)
 
 
+@quiet_rns_logging()
 def worker(
     worker_id: int,
     prefix_hex: str,
@@ -961,7 +998,7 @@ def worker(
     except (BrokenPipeError, EOFError):
         pass  # The parent has exited or closed this worker's result channel.
     except Exception as exc:
-        error = ascii(f"{type(exc).__name__}: {exc}")[1:-1][:160]
+        error = type(exc).__name__[:160]
         try:
             send_worker_message(messages, (MSG_ERROR, worker_id, error))
         except OSError:
@@ -1027,7 +1064,7 @@ def validate_match_payload(
             return "worker returned an invalid RNS private key"
         derived_addr_hex = lxmf_hash_hex_for_identity(identity)
     except Exception as exc:
-        return f"worker private-key validation failed: {type(exc).__name__}: {exc}"
+        return f"worker private-key validation failed: {type(exc).__name__}"
     if derived_addr_hex != claimed_addr_hex:
         return "worker returned an inconsistent LXMF destination hash"
     if not matches_vanity(derived_addr_hex, prefix_hex, postfix_hex):
@@ -1097,7 +1134,7 @@ def record_worker_message(
                 raise ValueError(f"duplicate completion from worker {worker_id}")
             state.done_workers.add(worker_id)
         else:
-            raise ValueError(f"unknown or malformed message tag {tag!r}")
+            raise ValueError("unknown or malformed message tag")
     except ValueError as exc:
         state.errors.append(f"received a malformed worker message: {exc}")
 
@@ -1372,7 +1409,7 @@ def run_generation(
     """Run workers, validate a winner, and safely publish its identity."""
     staging: OutputStaging | None = None
     started_workers: list[WorkerHandle] = []
-    state = SearchState()
+    state = signal_state.search
     started_at: float | None = None
     workers_collected = False
 
@@ -1460,8 +1497,7 @@ def run_generation(
             if state.match_private_key is None:
                 raise
             state.errors.append(str(exc))
-        if state.match_private_key is None:
-            signal_state.raise_if_requested()
+        signal_state.raise_if_requested()
 
         if state.match_private_key is None or state.match_addr_hex is None:
             error = (
@@ -1582,16 +1618,32 @@ def run_generation(
                     else None
                 )
             if recovery_path is not None:
+                expected = (
+                    f" Expected lxmf.delivery address: {state.match_addr_hex}."
+                    if state.match_addr_hex is not None
+                    else ""
+                )
                 print_diagnostic(
                     "RECOVERY: possible private-key staging at "
                     f"{recovery_path!r}; verify it before use and do not share it."
+                    + expected
                 )
 
 
+@quiet_rns_logging()
 def main(argv: Sequence[str] | None = None) -> int:
     replace_unusable_std_streams()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        # argparse can leave buffered help, version or usage text on a dead pipe.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                silence_dead_stream(stream)
+        raise
     disable_core_dumps()
     try:
         reconfigure = getattr(sys.stdout, "reconfigure", None)

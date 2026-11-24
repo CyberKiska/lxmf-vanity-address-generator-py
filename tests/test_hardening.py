@@ -17,6 +17,23 @@ import main
 
 
 class CompatibilityPolicyTests(unittest.TestCase):
+    def test_cli_keeps_provider_diagnostics_out_of_both_streams(self):
+        marker = "provider-input-canary"
+
+        def fail_generation():
+            RNS.log(marker, RNS.LOG_ERROR)
+            raise ValueError(marker)
+
+        with (
+            mock.patch.object(main, "gen_identity", side_effect=fail_generation),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            result = main.main(["--prefix=a", "--out=identity"])
+        self.assertEqual(result, 2)
+        self.assertTrue("compatibility check failed" in stderr.getvalue())
+        self.assertFalse(marker in stdout.getvalue() + stderr.getvalue())
+
     def test_runtime_is_gated_by_behaviour_not_version_strings(self):
         for reported in ("0.0.1", "2.0.0", "9.9.9rc1", "unknown"):
             with (
