@@ -167,8 +167,11 @@ The generator never overwrites an existing path or follows a final-path
 symlink. These controls do not make an attacker-controlled parent directory
 safe. Write identities only to a private, trusted directory. Backups,
 filesystem snapshots, endpoint security software, swap, and terminal logging
-can retain secrets outside the program's control. POSIX mode `0600` is enforced
-where supported; verify equivalent ACL protection on non-POSIX systems.
+can retain secrets outside the program's control. On POSIX, preflight checks the
+effective mode after requesting `0600`. Choose another output directory if its
+filesystem cannot retain that mode. On macOS, the FAT16 and exFAT mounts tested
+during the audit reported `0700` and were rejected before the search. On
+Windows, verify the effective ACL on the target directory and identity.
 
 Before key generation, parent and workers make a best-effort request to suppress
 ordinary POSIX file core dumps by setting the soft `RLIMIT_CORE` limit to zero.
