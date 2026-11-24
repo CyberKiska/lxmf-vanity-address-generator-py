@@ -10,6 +10,23 @@ import main
 
 
 class OutputLifecycleTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX file mode required")
+    def test_ineffective_chmod_fails_before_any_private_or_probe_write(self):
+        chmod = os.fchmod
+        for create in (main.prepare_output_staging, main._exclusive_output_fd):
+            with (
+                self.subTest(operation=create.__name__),
+                tempfile.TemporaryDirectory() as directory,
+                mock.patch.object(
+                    os, "fchmod", side_effect=lambda fd, _: chmod(fd, 0o700)
+                ),
+                mock.patch.object(main, "_write_all") as write,
+            ):
+                with self.assertRaisesRegex((OSError, ValueError), "mode 0600"):
+                    create(os.path.join(directory, "identity"))
+                write.assert_not_called()
+                self.assertEqual(os.listdir(directory), [])
+
     def test_interrupted_stage_contains_only_the_bytes_written(self):
         key = main.COMPAT_PRIVATE_KEY
         for size in (8, len(key)):

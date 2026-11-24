@@ -13,6 +13,7 @@ import multiprocessing as mp
 from multiprocessing.connection import Connection, wait
 import os
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -519,6 +520,19 @@ def _link_without_following(source: str, destination: str) -> None:
         ) from exc
 
 
+def _private_file_stat(fd: int) -> os.stat_result:
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
+    info = os.fstat(fd)
+    if os.name == "posix" and stat.S_IMODE(info.st_mode) != 0o600:
+        raise OSError(
+            f"output filesystem did not retain mode 0600 (reported "
+            f"{stat.S_IMODE(info.st_mode):04o}). Choose a directory that "
+            "supports private POSIX file permissions"
+        )
+    return info
+
+
 def _exclusive_output_fd(path: str) -> tuple[int, tuple[int, int]]:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW"):
@@ -527,10 +541,8 @@ def _exclusive_output_fd(path: str) -> tuple[int, tuple[int, int]]:
     created_inode: tuple[int, int] | None = None
     try:
         fd = os.open(path, flags, 0o600)
-        created_stat = os.fstat(fd)
+        created_stat = _private_file_stat(fd)
         created_inode = created_stat.st_dev, created_stat.st_ino
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
         return fd, created_inode
     except BaseException:
         if fd >= 0 and created_inode is None:
@@ -849,9 +861,7 @@ def prepare_output_staging(path: str) -> OutputStaging:
             suffix=OUTPUT_STAGING_SUFFIX,
             dir=parent,
         )
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
-        staging_stat = os.fstat(fd)
+        staging_stat = _private_file_stat(fd)
         staging_inode = staging_stat.st_dev, staging_stat.st_ino
         _write_all(fd, OUTPUT_STAGING_MARKER)
         _flush_fd(fd)
