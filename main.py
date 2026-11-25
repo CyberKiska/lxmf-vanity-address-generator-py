@@ -1625,12 +1625,18 @@ def run_generation(
                     if staging.may_contain_private_key
                     else None
                 )
-            if recovery_path is not None:
-                expected = (
-                    f" Expected lxmf.delivery address: {state.match_addr_hex}."
-                    if state.match_addr_hex is not None
-                    else ""
+            expected = (
+                f" Expected lxmf.delivery address: {state.match_addr_hex}."
+                if state.match_addr_hex is not None
+                else ""
+            )
+            if staging.final_published and not staging.finalized:
+                print_diagnostic(
+                    "RECOVERY: private identity published at "
+                    f"{staging.final_path!r} before the run failed; verify it "
+                    "before use and do not share it." + expected
                 )
+            if recovery_path is not None:
                 print_diagnostic(
                     "RECOVERY: possible private-key staging at "
                     f"{recovery_path!r}; verify it before use and do not share it."

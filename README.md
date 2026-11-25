@@ -154,10 +154,12 @@ key material and reports its path as `RECOVERY:`. When a winner was verified,
 the diagnostic includes its public destination. A staging write can be partial.
 Before using the file, check that it is 64 bytes and use the `rnid` command
 below with the recovery path. Its destination must match the reported winner.
-A failed flush leaves durability uncertain. If flushing staging-name removal
-fails after the final identity has already been committed, the error identifies
-the saved final file. A failed run can therefore leave an identity at the
-requested path; inspect the reported paths before retrying. Treat every
+A failed flush leaves durability uncertain. If a run fails after the identity
+was published at the requested path, a second `RECOVERY:` line names that path;
+check it the same way. If flushing staging-name removal fails after the final
+identity has already been committed, the error identifies the saved final file.
+A failed run can therefore leave an identity at the requested path; inspect the
+reported paths before retrying. Treat every
 file named `.lxmf-identity-*.staging` as secret: a force kill, power loss, or
 process crash can leave either a harmless preflight marker or private key
 material there. A leftover `.lxmf-identity-*.probe` contains no private key.

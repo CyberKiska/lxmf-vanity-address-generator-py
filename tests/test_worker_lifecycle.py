@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import os
 from pathlib import Path
@@ -40,6 +41,33 @@ class WorkerLifecycleRegressionTests(unittest.TestCase):
             self.assertTrue(address.startswith("a"))
             self.assertTrue("RECOVERY:" in stderr.getvalue(), "missing recovery notice")
             self.assertTrue(address in stderr.getvalue(), "missing recovery address")
+
+    def test_failure_after_publication_names_the_published_identity(self):
+        flush_directory = main._fsync_directory
+
+        def fail_after_publication(path):
+            if output.exists():
+                raise OSError(errno.EIO, "directory flush failed")
+            return flush_directory(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory, "winner")
+            with (
+                mock.patch.object(
+                    main, "_fsync_directory", side_effect=fail_after_publication
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                result = main.main(["--workers=1", "--prefix=a", f"--out={output}"])
+            self.assertEqual(result, 1)
+            identity = main.RNS.Identity.from_file(str(output))
+            self.assertIsNotNone(identity)
+            address = main.RNS.Destination.hash(identity, "lxmf", "delivery").hex()
+            notice = f"RECOVERY: private identity published at {str(output)!r}"
+            diagnostics = stderr.getvalue()
+            self.assertTrue(notice in diagnostics, "published output not reported")
+            self.assertTrue(address in diagnostics, "missing published address")
 
     def test_key_provider_errors_do_not_enter_worker_diagnostics(self):
         # A public canary stands in for data echoed by a failing provider.
