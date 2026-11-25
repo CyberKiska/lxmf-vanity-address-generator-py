@@ -90,6 +90,34 @@ class OutputLifecycleTests(unittest.TestCase):
             self.assertEqual(len(closed), 1)
             self.assertFalse(os.path.lexists(path))
 
+    def test_preflight_close_error_keeps_the_original_failure(self):
+        real_close = os.close
+
+        def delayed_close(fd):
+            real_close(fd)
+            raise OSError(errno.EIO, "close failed")
+
+        for failure, expected in (
+            (OSError(errno.ENOSPC, "storage full"), ValueError),
+            (KeyboardInterrupt(), KeyboardInterrupt),
+        ):
+            with (
+                self.subTest(failure=type(failure).__name__),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = os.path.join(directory, "identity")
+                with (
+                    mock.patch.object(os, "close", side_effect=delayed_close) as close,
+                    mock.patch.object(main, "_write_all", side_effect=failure),
+                ):
+                    with self.assertRaises(expected) as caught:
+                        main.prepare_output_staging(path)
+                self.assertEqual(close.call_count, 1)
+                self.assertNotIn("close failed", str(caught.exception))
+                if expected is ValueError:
+                    self.assertIn("storage full", str(caught.exception))
+                self.assertEqual(os.listdir(directory), [])
+
     def test_private_reload_errors_do_not_repeat_provider_input(self):
         for step in ("staging", "final"):
             with self.subTest(step=step), tempfile.TemporaryDirectory() as directory:

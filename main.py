@@ -920,10 +920,8 @@ def prepare_output_staging(path: str) -> OutputStaging:
         try:
             if fd >= 0:
                 os.close(fd)
-        except OSError as close_exc:
-            raise ValueError(
-                f"could not close output preflight file: {close_exc}"
-            ) from close_exc
+        except OSError:
+            pass  # Report the failure that started cleanup, not the close.
         finally:
             if staging_path is not None:
                 try:
