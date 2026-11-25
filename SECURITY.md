@@ -5,9 +5,9 @@
 Security fixes are prepared for the current default branch. The supported
 configuration is the latest stable RNS release actually tested successfully by
 CI, with PyCA cryptography on CPython 3.14 under Linux, macOS and Windows.
-CI runs on pushes, pull requests and weekly; a newly released dependency is
-not verified until those jobs pass. RNS 1.5.2 is the chosen installation minimum,
-and cryptography 50.0.0 is the installation floor from the dated advisory review.
+CI runs on pushes, pull requests and weekly. Check the stable jobs for the exact
+commit and resolved versions before release. Separate compatibility jobs run
+with the installation floors pinned to RNS 1.5.2 and cryptography 50.0.0.
 Audit the actual resolved versions before deployment.
 
 Startup known answers check specific protocol properties, not security or full
